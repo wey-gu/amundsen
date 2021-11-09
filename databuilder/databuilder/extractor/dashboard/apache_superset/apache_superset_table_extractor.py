@@ -93,8 +93,8 @@ class ApacheSupersetTableExtractor(ApacheSupersetBaseExtractor):
 
     @property
     def driver_mapping(self) -> Dict[str, str]:
-        return dict(self.conf.get(self.DRIVER_TO_DATABASE_MAPPING))
+        return self.conf.get(self.DRIVER_TO_DATABASE_MAPPING)
 
     @property
     def cluster_mapping(self) -> Dict[str, str]:
-        return dict(self.conf.get(self.DATABASE_TO_CLUSTER_MAPPING))
+        return self.conf.get(self.DATABASE_TO_CLUSTER_MAPPING)
