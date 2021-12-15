@@ -108,9 +108,9 @@ class FsNebulaCSVLoader(Loader):
         :return:
         """
 
-        vertex = csv_serializable.next_vertex()
+        vertex = csv_serializable.next_node()
         while vertex:
-            vertex_dict = nebula_serializer.prepare_vertex(vertex)
+            vertex_dict = nebula_serializer.serialize_node(vertex)
             key = (vertex.label, self._make_key(vertex_dict))
             file_suffix = '{}_{}'.format(*key)
             vertex_writer = self._get_writer(
@@ -120,11 +120,11 @@ class FsNebulaCSVLoader(Loader):
                 self._vertex_dir,
                 file_suffix)
             vertex_writer.writerow(vertex_dict)
-            vertex = csv_serializable.next_vertex()
+            vertex = csv_serializable.next_node()
 
         relation = csv_serializable.next_relation()
         while relation:
-            relation_dict = nebula_serializer.prepare_edge(relation)
+            relation_dict = nebula_serializer.serialize_relationship(relation)
             key2 = (relation.start_label,
                     relation.end_label,
                     relation.type,
