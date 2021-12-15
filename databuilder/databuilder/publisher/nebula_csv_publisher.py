@@ -6,7 +6,9 @@ import ctypes
 import json
 import logging
 import random
+import re
 import time
+from functools import wraps
 from io import open
 from os import listdir
 from os.path import isfile, join
@@ -36,6 +38,7 @@ EDGE_FILES_DIR = "edge_files_directory"
 # Endpoint list for Nebula e.g: 192.168.11.1:9669,192.168.11.2:9669
 NEBULA_ENDPOINTS = "nebula_endpoints"
 NEBULA_MAX_CONN_POOL_SIZE = "nebula_max_conn_pool_size"
+NEBULA_VID_LENGTH = "nebula_vid_length"
 
 NEBULA_USER = "nebula_user"
 NEBULA_PASSWORD = "nebula_password"
@@ -44,8 +47,7 @@ NEBULA_INSERT_BATCHSIZE = "nebula_insert_batchsize"
 NEBULA_RETRY_NUMBER = "nebula_retry_number"
 
 LAST_UPDATED_EPOCH_MS = 'publisher_last_updated_epoch_ms'
-PUBLISHED_TAG_PROPERTY_NAME = 'published_tag'
-PUBLISHED_EDGE_PROPERTY_NAME = 'published_edge'
+PUBLISHED_PROPERTY_NAME = 'published'
 JOB_PUBLISH_TAG = 'job_publish_tag'
 
 # CSV HEADER
@@ -59,11 +61,11 @@ TAG_REQUIRED_KEYS = {TAG_KEY, VID_KEY}
 
 # Edges relates two vertecis together
 # Start vertex tag
-EDGE_START_TAG = "START_TAG"
+EDGE_START_TAG = "START_LABEL"
 # Start vertex key
 EDGE_START_KEY = "START_KEY"
 # End vertex tag
-EDGE_END_TAG = "END_TAG"
+EDGE_END_TAG = "END_LABEL"
 # Vertex key
 EDGE_END_KEY = "END_KEY"
 # Type for edge (Start Vertex)->(End Vertex)
@@ -72,24 +74,61 @@ EDGE_TYPE = "TYPE"
 EDGE_REVERSE_TYPE = "REVERSE_TYPE"
 # Required columns for Edge
 EDGE_REQUIRED_KEYS = {
-    EDGE_START_TAG,
     EDGE_START_KEY,
-    EDGE_END_TAG,
     EDGE_END_KEY,
     EDGE_TYPE,
-    EDGE_REVERSE_TYPE,
 }
 NEBULA_EXISTED = "existed"
-NEBULA_UNQUOTED_TYPES = {"int64", "float"}
+NEBULA_UNQUOTED_TYPES = {"int64", "float", "bool"}
 
 DEFAULT_CONFIG = ConfigFactory.from_dict({
     NEBULA_SPACE: "amundsen",
     NEBULA_INSERT_BATCHSIZE: 64,
-    NEBULA_RETRY_NUMBER: 4}
+    NEBULA_RETRY_NUMBER: 4,
+    NEBULA_MAX_CONN_POOL_SIZE: 10,
+    NEBULA_VID_LENGTH: 256}
 )
 
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
+
+
+def retry(backoff_sec: int = 1) -> T:
+    """
+    An exponential backoff decorator
+    :param fn: The function to be retried.
+    :param backoff_sec: The time in second per each backoff step.
+    """
+
+    def decorator_retry(fn):
+        @wraps(fn)
+        def fn_retry(*args, **kwargs):
+            attempts = 0
+            _backoff_sec = backoff_sec
+            _retry_num = args[0]._nebula_retry_number
+            while True:
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    if attempts == _retry_num:
+                        LOGGER.debug(
+                            "%s attempts of retry exceeded.", _retry_num)
+                        raise e
+                    else:
+                        sleep = backoff_sec * 2 ** attempts + random.uniform(
+                            0, 1)
+                        LOGGER.debug(
+                            "Retried for %s times, sleeping for %s seconds...",
+                            attempts,
+                            sleep,
+                        )
+                        time.sleep(sleep)
+                        attempts += 1
+            return fn(*args, **kwargs)
+
+        return fn_retry  # the decorator
+
+    return decorator_retry
 
 
 class NebulaCsvPublisher(Publisher):
@@ -117,52 +156,23 @@ class NebulaCsvPublisher(Publisher):
         self._nebula_space = conf.get_string(NEBULA_SPACE)
         self._nebula_max_conn_pool_size = conf.get_int(
             NEBULA_MAX_CONN_POOL_SIZE)
-        self._nebula_endpoints = conf.get_list(NEBULA_ENDPOINTS)
-        self._conn_pool = self._init_connection_pool()
+        self._nebula_vid_length = conf.get_int(
+            NEBULA_VID_LENGTH)
+        self._nebula_endpoints = conf.get_string(NEBULA_ENDPOINTS)
         self._nebula_credential = (
             conf.get_string(NEBULA_USER),
             conf.get_string(NEBULA_PASSWORD),
         )
-        self._nebula_insert_batchsize = conf.get_int(NEBULA_INSERT_BATCHSIZE)
         self._nebula_retry_number = conf.get_int(NEBULA_RETRY_NUMBER)
+        self._conn_pool = self._init_connection_pool()
+
+        self._nebula_insert_batchsize = conf.get_int(NEBULA_INSERT_BATCHSIZE)
 
         self.tags: Set[str] = set()
+        self.edge_types: Set[str] = set()
         self.publish_tag: str = conf.get_string(JOB_PUBLISH_TAG)
         if not self.publish_tag:
             raise Exception(f"{ JOB_PUBLISH_TAG } should not be empty")
-
-        LOGGER.info(
-            "Publishing vertex csv files %s, and edge CSV files %s",
-            self._vertex_files,
-            self._edge_files,
-        )
-
-    def retry_with_backoff(
-            self, fn: Callable[[], T], backoff_in_sec: int = 1) -> T:
-        """
-        An exponential backoff decorator
-        :param fn: The function to be retried.
-        :param backoff_in_sec: The time in second per each backoff step
-        """
-        retry_num = self._nebula_retry_number
-        attempts = 0
-        while True:
-            try:
-                return fn()
-            except:  # noqa: E722
-                if attempts == retry_num:
-                    LOGGER.debug("%s attempts of retry exceeded.", retry_num)
-                    raise
-                else:
-                    sleep = backoff_in_sec * 2 ** attempts + random.uniform(
-                        0, 1)
-                    LOGGER.debug(
-                        "Retried for %s times, sleeping for %s seconds...",
-                        attempts,
-                        sleep,
-                    )
-                    time.sleep(sleep)
-                    attempts += 1
 
     def _init_connection_pool(self) -> ConnectionPool:
         """
@@ -171,7 +181,20 @@ class NebulaCsvPublisher(Publisher):
         connection_pool = ConnectionPool()
         config = Config()
         config.max_connection_pool_size = self._nebula_max_conn_pool_size
-        connection_pool.init(self._nebula_endpoints, config)
+        nebula_endpoints = [
+            (e.split(":")[0], int(e.split(":")[1]))
+                for e in self._nebula_endpoints.split(",") if e]
+
+        connection_pool.init(nebula_endpoints, config)
+        with connection_pool.session_context(
+                *self._nebula_credential) as session:
+            session.execute(
+                f"CREATE SPACE IF NOT EXISTS "
+                f"{ self._nebula_space } "
+                f"(vid_type=FIXED_STRING({ self._nebula_vid_length }));")
+            # CREATE SPCAE has been shot the async way
+            # ref: https://t.co/Rgc5HomQJj
+            self._execute_query(f"USE { self._nebula_space }", session)
         return connection_pool
 
     def _list_files(self, conf: ConfigTree, path_key: str) -> List[str]:
@@ -193,6 +216,12 @@ class NebulaCsvPublisher(Publisher):
         """
 
         start = time.time()
+
+        LOGGER.info(
+            "Publishing vertex csv files %s, and edge CSV files %s",
+            self._vertex_files,
+            self._edge_files,
+        )
 
         # Nebula is designed to be schemaful, read more on its documentation:
         # https://docs.nebula-graph.io/2.6.1/2.quick-start/4.nebula-graph-crud
@@ -245,7 +274,7 @@ class NebulaCsvPublisher(Publisher):
         """
         template = Template(
             """
-            CREATE TAG {{ TAG_KEY }}({{ PROPERTIES }});
+            CREATE TAG `{{ TAG_KEY }}`({{ PROPERTIES }});
         """
         )
         properties = self._ddl_props_body(vertex_record, TAG_REQUIRED_KEYS)
@@ -266,7 +295,7 @@ class NebulaCsvPublisher(Publisher):
                 continue
 
             prop_type = k.split(":")[-1]
-            prop_name = k.removesuffix(f":{ prop_type }")
+            prop_name = k.rstrip(f":{ prop_type }")
             target[prop_name] = prop_type
         involved = list(set(target.items()) - set(cur_props.items()))
         changed = [el for el in involved if el[0] in cur_props]
@@ -276,18 +305,18 @@ class NebulaCsvPublisher(Publisher):
 
         template = Template(
             """
-            {%- if changed %}ALTER TAG {{ TAG_KEY }} CHANGE(
-                {%- for el in changed %}{{ el[0] }} {{ el[1] }} NULL \
+            {%- if changed %}ALTER TAG `{{ TAG_KEY }}` CHANGE(
+                {%- for el in changed %}`{{ el[0] }}` {{ el[1] }} NULL \
                     {{- ", " if not loop.last else "" }}
                 {%- endfor %});
             {%- endif %}
-            {%- if added %}ALTER TAG {{ TAG_KEY }} ADD(
-                {%- for el in added %}{{ el[0] }} {{ el[1] }} NULL \
+            {%- if added %}ALTER TAG `{{ TAG_KEY }}` ADD(
+                {%- for el in added %}`{{ el[0] }}` {{ el[1] }} NULL \
                     {{- ", " if not loop.last else "" }}
                 {%- endfor %});
             {%- endif %}
-            {%- if deleted %}ALTER TAG {{ TAG_KEY }} DROP(
-                {%- for el in deleted %}{{ el[0] }} {{ el[1] }} NULL \
+            {%- if deleted %}ALTER TAG `{{ TAG_KEY }}` DROP(
+                {%- for el in deleted %}`{{ el[0] }}` \
                     {{- ", " if not loop.last else "" }}
                 {%- endfor %});
             {%- endif %}
@@ -309,7 +338,7 @@ class NebulaCsvPublisher(Publisher):
         """
         template = Template(
             """
-            CREATE EDGE {{ EDGE_TYPE }}({{ PROPERTIES }});
+            CREATE EDGE `{{ EDGE_TYPE }}`({{ PROPERTIES }});
         """
         )
         properties = self._ddl_props_body(edge_record, EDGE_REQUIRED_KEYS)
@@ -330,7 +359,7 @@ class NebulaCsvPublisher(Publisher):
                 continue
 
             prop_type = k.split(":")[-1]
-            prop_name = k.removesuffix(f":{ prop_type }")
+            prop_name = k.rstrip(f":{ prop_type }")
             target[prop_name] = prop_type
         involved = list(set(target.items()) - set(cur_props.items()))
         changed = [el for el in involved if el[0] in cur_props]
@@ -340,18 +369,18 @@ class NebulaCsvPublisher(Publisher):
 
         template = Template(
             """
-            {%- if changed %}ALTER EDGE {{ EDGE_TYPE }} CHANGE(
-                {%- for el in changed %}{{ el[0] }} {{ el[1] }} NULL \
+            {%- if changed %}ALTER EDGE `{{ EDGE_TYPE }}` CHANGE(
+                {%- for el in changed %}`{{ el[0] }}` {{ el[1] }} NULL \
                     {{- ", " if not loop.last else "" }}
                 {%- endfor %});
             {%- endif %}
-            {%- if added %}ALTER EDGE {{ EDGE_TYPE }} ADD(
-                {%- for el in added %}{{ el[0] }} {{ el[1] }} NULL \
+            {%- if added %}ALTER EDGE `{{ EDGE_TYPE }}` ADD(
+                {%- for el in added %}`{{ el[0] }}` {{ el[1] }} NULL \
                     {{- ", " if not loop.last else "" }}
                 {%- endfor %});
             {%- endif %}
-            {%- if deleted %}ALTER TAG {{ EDGE_TYPE }} DROP(
-                {%- for el in deleted %}{{ el[0] }} {{ el[1] }} NULL \
+            {%- if deleted %}ALTER EDGE `{{ EDGE_TYPE }}` DROP(
+                {%- for el in deleted %}`{{ el[0] }}` \
                     {{- ", " if not loop.last else "" }}
                 {%- endfor %});
             {%- endif %}\
@@ -369,59 +398,67 @@ class NebulaCsvPublisher(Publisher):
             self, session: Session, vertex_record: dict) -> ResultSet:
         try:
             r_json_string = session.execute_json(
-                f"DESCRIBE TAG { vertex_record[TAG_KEY] };"
+                f"DESCRIBE TAG `{ vertex_record[TAG_KEY] }`;"
             ).decode("utf-8")
+
+            cur_propertices = {
+                p["row"][0]: p["row"][1]
+                for p in json.loads(r_json_string)["results"][0]["data"]
+            }
         except Exception as e:
-            LOGGER.debug(
-                "Alter Tag Schema failed when getting existing TAG %s",
+            LOGGER.exception(
+                "Alter Tag Schema failed when getting existing TAG %s,\n%s",
                 vertex_record[TAG_KEY],
+                r_json_string
             )
             raise e
 
-        cur_propertices = {
-            p["row"][0]: p["row"][1]
-            for p in json.loads(r_json_string)["results"][0]["data"]
-        }
-        cur_propertices.pop(PUBLISHED_TAG_PROPERTY_NAME)
-        cur_propertices.pop(LAST_UPDATED_EPOCH_MS)
+        cur_propertices.pop(PUBLISHED_PROPERTY_NAME, None)
+        cur_propertices.pop(LAST_UPDATED_EPOCH_MS, None)
 
         query = self.make_alter_tag_command(vertex_record, cur_propertices)
+        if not query.strip():
+            # No alter is needed.
+            return
         try:
+            LOGGER.debug("Query: %s", query)
             r = session.execute(query)
         except Exception as e:
-            LOGGER.debug(
-                "Alter Tag Schema failed when executing ALTER TAG %s",
+            LOGGER.exception(
+                "Alter Tag Schema failed when for TAG %s,\n%s",
                 vertex_record[TAG_KEY],
+                str(cur_propertices)
             )
             raise e
 
-        if r.is_suceeded():
+        if r.is_succeeded():
             return r
         else:
-            LOGGER.debug(
+            LOGGER.exception(
                 "Alter Tag Schema: %s with error %s", query, r.error_msg())
             raise RuntimeError(f"Failed when altering tag schema: { query }")
 
-    @retry_with_backoff()
+    @retry()
     def _create_tag_schema(
             self, session: Session, vertex_record: dict) -> ResultSet:
         query = self.make_create_tag_command(vertex_record)
         try:
+            LOGGER.debug("Query: %s", query)
             r = session.execute(query)
         except Exception as e:
-            LOGGER.debug(
-                "CREATE Tag Schema failed when executing CREATE TAG %s",
+            LOGGER.exception(
+                "CREATE Tag Schema failed when for TAG %s",
                 vertex_record[TAG_KEY],
             )
             raise e
-        if r.is_suceeded():
+        if r.is_succeeded():
             return r
         elif (r.error_code() == ErrorCode.E_EXECUTION_ERROR and
                 NEBULA_EXISTED in r.error_msg().lower()):
             return self._alter_tag_schema(
                 session=session, vertex_record=vertex_record)
         else:
-            LOGGER.debug(
+            LOGGER.exception(
                 "Create tag schema: %s with error %s", query, r.error_msg())
             raise RuntimeError(f"Failed when creating tag schema: { query }")
 
@@ -429,52 +466,68 @@ class NebulaCsvPublisher(Publisher):
             self, session: Session, edge_record: dict) -> ResultSet:
         try:
             r_json_string = session.execute_json(
-                f"DESCRIBE EDGE { edge_record[EDGE_TYPE] };"
+                f"DESCRIBE EDGE `{ edge_record[EDGE_TYPE] }`;"
             ).decode("utf-8")
+
+            cur_propertices = {
+                p["row"][0]: p["row"][1]
+                for p in json.loads(r_json_string)["results"][0]["data"]
+            }
+
         except Exception as e:
-            LOGGER.debug(
-                "Alter Edge Schema failed when getting existing EDGE %s",
+            LOGGER.exception(
+                "Alter Edge Schema failed when getting existing EDGE %s,\n%s",
                 edge_record[EDGE_TYPE],
+                r_json_string
             )
             raise e
 
-        cur_propertices = {
-            p["row"][0]: p["row"][1]
-            for p in json.loads(r_json_string)["results"][0]["data"]
-        }
-        cur_propertices.pop(PUBLISHED_EDGE_PROPERTY_NAME)
-        cur_propertices.pop(LAST_UPDATED_EPOCH_MS)
+        cur_propertices.pop(PUBLISHED_PROPERTY_NAME, None)
+        cur_propertices.pop(LAST_UPDATED_EPOCH_MS, None)
 
         query = self.make_alter_edgetype_command(edge_record, cur_propertices)
+        if not query.strip():
+            # No alter is needed.
+            return
         try:
+            LOGGER.debug("Query: %s", query)
             r = session.execute(query)
         except Exception as e:
-            LOGGER.debug(
-                "Alter Edge Schema failed when executing ALTER EDGE %s",
+            LOGGER.exception(
+                "Alter Edge Schema failed for ALTER EDGE %s,\n%s",
                 edge_record[TAG_KEY],
+                str(cur_propertices)
             )
             raise e
 
-        if r.is_suceeded():
+        if r.is_succeeded():
             return r
         else:
-            LOGGER.debug(
+            LOGGER.exception(
                 "Alter Edge Schema: %s with error %s", query, r.error_msg())
             raise RuntimeError(f"Failed when altering edge schema: { query }")
 
-    @retry_with_backoff()
+    @retry()
     def _create_edgetype_schema(
             self, session: Session, edge_record: dict) -> None:
         query = self.make_create_edgetype_command(edge_record)
-        r = session.execute(query)
-        if r.is_suceeded():
+        try:
+            LOGGER.debug("Query: %s", query)
+            r = session.execute(query)
+        except Exception as e:
+            LOGGER.exception(
+                "CREATE edge type Schema failed for edge type %s",
+                vertex_record[TAG_KEY],
+            )
+            raise e
+        if r.is_succeeded():
             return r
         elif (r.error_code() == ErrorCode.E_EXECUTION_ERROR and
                 NEBULA_EXISTED in r.error_msg().lower()):
             return self._alter_edgetype_schema(
                 session=session, edge_record=edge_record)
         else:
-            LOGGER.debug(
+            LOGGER.exception(
                 "Create edge type schema: %s with error %s",
                 query, r.error_msg())
             raise RuntimeError(
@@ -506,7 +559,7 @@ class NebulaCsvPublisher(Publisher):
                 ):
                     edge_type = edge_record[EDGE_TYPE]
                     if edge_type not in self.edge_types:
-                        self._create_edgetype_schema(edge_record)
+                        self._create_edgetype_schema(session, edge_record)
                         self.edge_types.add(edge_type)
 
     def _import_vertices(self, vertex_file: str, session: Session) -> None:
@@ -546,28 +599,27 @@ class NebulaCsvPublisher(Publisher):
         :return:
         """
         tag = vertex_records[0][TAG_KEY]
-        prop_keys = list(set(vertex_records[0].keys) - TAG_REQUIRED_KEYS)
-        property_list = list(filter(self._get_prop_name, prop_keys)) + (
-            PUBLISHED_TAG_PROPERTY_NAME,
+        prop_keys = list(set(vertex_records[0].keys()) - TAG_REQUIRED_KEYS)
+        property_list = list(map(self._get_prop_name, prop_keys)) + [
+            PUBLISHED_PROPERTY_NAME,
             LAST_UPDATED_EPOCH_MS,
-        )
+        ]
         properties = ", ".join(property_list)
 
-        command_prefix = f"INSERT VERTEX { tag } ({ properties }) VALUES"
+        command_prefix = f"INSERT VERTEX `{ tag }` ({ properties }) VALUES"
 
-        prop_str_suffix = f',"{ self._publish_tag }",timestamp()'
+        prop_str_suffix = f',"{ self.publish_tag }",timestamp()'
 
         formated_records = list()
         for rec in vertex_records:
-            prop_list = [
-                self._quote(p) + rec[p] + self._quote(p) for p in prop_keys]
-            formated_records.append(
-                rec[VID_KEY], ",".join(prop_list) + prop_str_suffix)
+            prop_list = [self.formated_prop(p, rec[p]) for p in prop_keys]
+            formated_records.append((
+                rec[VID_KEY], ",".join(prop_list) + prop_str_suffix))
 
         template = Template("""
             {%- for r in RECORDS %} "{{ r[0] }}":({{ r[1] }})
             {{ ", " if not loop.last else "" }}
-            {%- endfor %});
+            {%- endfor %};
         """)
 
         return command_prefix + template.render(RECORDS=formated_records)
@@ -611,31 +663,29 @@ class NebulaCsvPublisher(Publisher):
         :return:
         """
         edge_type = edge_records[0][EDGE_TYPE]
-        prop_keys = list(set(edge_records[0].keys) - EDGE_REQUIRED_KEYS)
-        property_list = list(filter(self._get_prop_name, prop_keys)) + (
-            PUBLISHED_TAG_PROPERTY_NAME,
+        prop_keys = list(set(edge_records[0].keys()) - EDGE_REQUIRED_KEYS)
+        property_list = list(map(self._get_prop_name, prop_keys)) + [
+            PUBLISHED_PROPERTY_NAME,
             LAST_UPDATED_EPOCH_MS,
-        )
+        ]
         properties = ", ".join(property_list)
 
-        command_prefix = f"INSERT edge { edge_type } ({ properties }) VALUES"
+        command_prefix = f"INSERT edge `{ edge_type }` ({ properties }) VALUES"
 
-        prop_str_suffix = f',"{ self._publish_tag }", timestamp()'
+        prop_str_suffix = f',"{ self.publish_tag }", timestamp()'
 
         formated_records = list()
         for rec in edge_records:
-            prop_list = [
-                self._quote(p) + rec[p] + self._quote(p) for p in prop_keys]
-            formated_records.append(
+            prop_list = [self.formated_prop(p, rec[p]) for p in prop_keys]
+            formated_records.append((
                 rec[EDGE_START_KEY],
                 rec[EDGE_END_KEY],
-                ",".join(prop_list) + prop_str_suffix,
-            )
+                ",".join(prop_list) + prop_str_suffix))
 
         template = Template("""
-            {%- for r in RECORDS %}"{{ r[0] }}"->"{{ r[1] }}":({{ r[1] }})
+            {%- for r in RECORDS %}"{{ r[0] }}"->"{{ r[1] }}":({{ r[2] }})
             {{ ", " if not loop.last else "" }}
-            {%- endfor %});
+            {%- endfor %};
         """)
 
         return command_prefix + template.render(RECORDS=formated_records)
@@ -655,39 +705,55 @@ class NebulaCsvPublisher(Publisher):
                 continue
 
             prop_type = k.split(":")[-1]
-            prop_name = k.removesuffix(f":{ prop_type }")
+            prop_name = k.rstrip(f":{ prop_type }")
 
-            props.append(f"{ prop_name } { prop_type } NULL")
+            props.append(f"`{ prop_name }` { prop_type } NULL")
 
-        props.append(f"{PUBLISHED_TAG_PROPERTY_NAME} string NOT NULL")
+        props.append(f"{PUBLISHED_PROPERTY_NAME} string NOT NULL")
         props.append(f"{LAST_UPDATED_EPOCH_MS} timestamp NOT NULL")
 
         return ", ".join(props)
 
-    @retry_with_backoff()
+    @retry()
     def _execute_query(self, query: str, session: Session) -> ResultSet:
         """
         :param query:
         :param session:
         :return:
         """
+        LOGGER.debug("Query: %s", query)
         try:
             r = session.execute(query)
         except Exception as e:
-            LOGGER.debug("Failed executing query: %s", query)
+            LOGGER.exception("Failed executing query: %s", query)
             raise e
-        if r.is_suceeded():
+        if r.is_succeeded():
             return r
         else:
             raise RuntimeError(f"Failed executing query: { query }")
 
-    def _quote(self, prop):
-        if prop.split(":")[-1] in NEBULA_UNQUOTED_TYPES:
-            return '"'
-        else:
-            return ""
-
-    def _get_prop_name(self, prop):
+    @staticmethod
+    def _get_prop_name(prop: str) -> str:
         prop_type = prop.split(":")[-1]
-        prop_name = prop.removesuffix(f":{ prop_type }")
-        return prop_name
+        prop_name = prop.rstrip(f":{ prop_type }")
+        return f"`{ prop_name }`"
+
+    @staticmethod
+    def formated_prop(prop: str, value) -> str:
+        prop_type = prop.split(":")[-1]
+
+        if prop_type == "string":
+            # Preprocess string values:
+            # 0. str() it for non str type parsed value
+            # 1. Remove extra pair of quotes
+            # 2. Escape the string
+            if not isinstance(value, str):
+                value = str(value)
+            if value.startswith('"') and value.endswith('"'):
+                value = value[1:-1]
+            value = re.escape(value)
+
+        if prop_type in NEBULA_UNQUOTED_TYPES:
+            return str(value)
+        else:
+            return f'"{ str(value) }"'

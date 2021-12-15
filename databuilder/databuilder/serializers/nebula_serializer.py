@@ -36,11 +36,11 @@ def serialize_relationship(
 
     relationship_dict = {
         RELATION_START_KEY: relationship.start_key,
-        RELATION_START_LABEL: relationship.start_label,
+        RELATION_START_LABEL+":string": relationship.start_label,
         RELATION_END_KEY: relationship.end_key,
-        RELATION_END_LABEL: relationship.end_label,
+        RELATION_END_LABEL+":string": relationship.end_label,
         RELATION_TYPE: relationship.type,
-        RELATION_REVERSE_TYPE: relationship.reverse_type,
+        RELATION_REVERSE_TYPE+":string": relationship.reverse_type,
     }
     for key, value in relationship.attributes.items():
         property_type = _get_property_type(value)
