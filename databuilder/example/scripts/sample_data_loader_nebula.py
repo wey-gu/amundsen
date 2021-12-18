@@ -48,7 +48,7 @@ from databuilder.transformer.generic_transformer import (
 )
 
 es_host = os.getenv('CREDENTIALS_ELASTICSEARCH_PROXY_HOST', 'localhost')
-NEBULA_ENDPOINTS = os.getenv('CREDENTIALS_nebula_endpoints', 'localhost:9669')
+NEBULA_ENDPOINTS = os.getenv('CREDENTIALS_NEBULA_ENDPOINTS', 'localhost:9669')
 
 es_port = os.getenv('CREDENTIALS_ELASTICSEARCH_PROXY_PORT', 9200)
 

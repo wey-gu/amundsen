@@ -40,7 +40,7 @@ def serialize_relationship(
         RELATION_END_KEY: relationship.end_key,
         RELATION_END_LABEL+":string": relationship.end_label,
         RELATION_TYPE: relationship.type,
-        RELATION_REVERSE_TYPE+":string": relationship.reverse_type,
+        RELATION_REVERSE_TYPE: relationship.reverse_type,
     }
     for key, value in relationship.attributes.items():
         property_type = _get_property_type(value)
