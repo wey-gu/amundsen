@@ -77,6 +77,7 @@ EDGE_REQUIRED_KEYS = {
     EDGE_START_KEY,
     EDGE_END_KEY,
     EDGE_TYPE,
+    EDGE_REVERSE_TYPE
 }
 NEBULA_EXISTED = "existed"
 NEBULA_UNQUOTED_TYPES = {"int64", "float", "bool"}
@@ -295,7 +296,7 @@ class NebulaCsvPublisher(Publisher):
                 continue
 
             prop_type = k.split(":")[-1]
-            prop_name = k.rstrip(f":{ prop_type }")
+            prop_name = k[:-(len(prop_type) + 1)]
             target[prop_name] = prop_type
         involved = list(set(target.items()) - set(cur_props.items()))
         changed = [el for el in involved if el[0] in cur_props]
@@ -359,7 +360,7 @@ class NebulaCsvPublisher(Publisher):
                 continue
 
             prop_type = k.split(":")[-1]
-            prop_name = k.rstrip(f":{ prop_type }")
+            prop_name = k[:-(len(prop_type) + 1)]
             target[prop_name] = prop_type
         involved = list(set(target.items()) - set(cur_props.items()))
         changed = [el for el in involved if el[0] in cur_props]
@@ -551,6 +552,8 @@ class NebulaCsvPublisher(Publisher):
                         self._create_tag_schema(session, vertex_record)
                         self.tags.add(tag)
 
+        LOGGER.info("Creating Edge Schema")
+
         for edge_file in self._edge_files:
             with open(edge_file, "r", encoding="utf8") as edge_csv:
                 for edge_record in pandas.read_csv(
@@ -561,6 +564,14 @@ class NebulaCsvPublisher(Publisher):
                     if edge_type not in self.edge_types:
                         self._create_edgetype_schema(session, edge_record)
                         self.edge_types.add(edge_type)
+                    reverse_edge_type = edge_record[EDGE_REVERSE_TYPE]
+                    if reverse_edge_type not in self.edge_types:
+                        (edge_record[EDGE_TYPE],
+                            edge_record[EDGE_REVERSE_TYPE]) = (
+                                edge_record[EDGE_REVERSE_TYPE],
+                                edge_record[EDGE_TYPE])
+                        self._create_edgetype_schema(session, edge_record)
+                        self.edge_types.add(reverse_edge_type)
 
     def _import_vertices(self, vertex_file: str, session: Session) -> None:
         """
@@ -663,6 +674,7 @@ class NebulaCsvPublisher(Publisher):
         :return:
         """
         edge_type = edge_records[0][EDGE_TYPE]
+        reverse_edge_type = edge_records[0][EDGE_REVERSE_TYPE]
         prop_keys = list(set(edge_records[0].keys()) - EDGE_REQUIRED_KEYS)
         property_list = list(map(self._get_prop_name, prop_keys)) + [
             PUBLISHED_PROPERTY_NAME,
@@ -670,7 +682,11 @@ class NebulaCsvPublisher(Publisher):
         ]
         properties = ", ".join(property_list)
 
-        command_prefix = f"INSERT edge `{ edge_type }` ({ properties }) VALUES"
+        command_prefix = (
+            f"INSERT edge `{ edge_type }` ({ properties }) VALUES")
+
+        reverse_command_prefix = (
+            f"INSERT edge `{ reverse_edge_type }` ({ properties }) VALUES")
 
         prop_str_suffix = f',"{ self.publish_tag }", timestamp()'
 
@@ -688,7 +704,15 @@ class NebulaCsvPublisher(Publisher):
             {%- endfor %};
         """)
 
-        return command_prefix + template.render(RECORDS=formated_records)
+        reverse_template = Template("""
+            {%- for r in RECORDS %}"{{ r[1] }}"->"{{ r[0] }}":({{ r[2] }})
+            {{ ", " if not loop.last else "" }}
+            {%- endfor %};
+        """)
+
+        return command_prefix + template.render(RECORDS=formated_records) + \
+            reverse_command_prefix + reverse_template.render(
+                RECORDS=formated_records)
 
     def _ddl_props_body(self, record_dict: dict, excludes: Set) -> str:
         """
@@ -705,7 +729,7 @@ class NebulaCsvPublisher(Publisher):
                 continue
 
             prop_type = k.split(":")[-1]
-            prop_name = k.rstrip(f":{ prop_type }")
+            prop_name = k[:-(len(prop_type) + 1)]
 
             props.append(f"`{ prop_name }` { prop_type } NULL")
 
@@ -735,7 +759,7 @@ class NebulaCsvPublisher(Publisher):
     @staticmethod
     def _get_prop_name(prop: str) -> str:
         prop_type = prop.split(":")[-1]
-        prop_name = prop.rstrip(f":{ prop_type }")
+        prop_name = prop[:-(len(prop_type) + 1)]
         return f"`{ prop_name }`"
 
     @staticmethod
