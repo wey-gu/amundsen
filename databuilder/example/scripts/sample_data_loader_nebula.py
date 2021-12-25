@@ -26,12 +26,15 @@ import sys
 import uuid
 
 from amundsen_common.models.index_map import DASHBOARD_ELASTICSEARCH_INDEX_MAPPING, USER_INDEX_MAP
+from distutils.util import strtobool
 from elasticsearch import Elasticsearch
 from pyhocon import ConfigFactory
 from sqlalchemy.ext.declarative import declarative_base
 
 from databuilder.extractor.csv_extractor import (
-    CsvColumnLineageExtractor, CsvExtractor, CsvTableBadgeExtractor, CsvTableColumnExtractor, CsvTableLineageExtractor,
+    CsvColumnLineageExtractor, CsvExtractor, CsvTableBadgeExtractor, CsvTableColumnExtractor,
+    CsvTableLineageExtractor, CsvTableQueryExtractor, CsvTableQueryJoinExtractor,
+    CsvTableQueryWhereExtractor, CsvTableQueryExecutionExtractor
 )
 from databuilder.extractor.es_last_updated_extractor import EsLastUpdatedExtractor
 # from databuilder.extractor.nebula_search_data_extractor import NebulaSearchDataExtractor
@@ -212,6 +215,125 @@ def run_column_lineage_job(column_lineage_path):
     job.launch()
 
 
+def run_table_query_job(user_path, column_path, table_path, query_path):
+    tmp_folder = '/var/tmp/amundsen/table_query'
+    vertex_files_folder = f'{tmp_folder}/nodes'
+    edge_dir_files_folder = f'{tmp_folder}/relationships'
+    extractor = CsvTableQueryExtractor()
+    csv_loader = FsNebulaCSVLoader()
+    task = DefaultTask(extractor,
+                       loader=csv_loader,
+                       transformer=NoopTransformer())
+    job_config = ConfigFactory.from_dict({
+        'extractor.csvtablequery.user_file_location': user_path,
+        'extractor.csvtablequery.column_file_location': column_path,
+        'extractor.csvtablequery.table_file_location': table_path,
+        'extractor.csvtablequery.query_file_location': query_path,
+        'loader.filesystem_csv_nebula.vertex_dir_path': vertex_files_folder,
+        'loader.filesystem_csv_nebula.edge_dir_path': edge_dir_files_folder,
+        'loader.filesystem_csv_nebula.delete_created_directories': True,
+        'publisher.nebula.vertex_files_directory': vertex_files_folder,
+        'publisher.nebula.edge_files_directory': edge_dir_files_folder,
+        'publisher.nebula.nebula_endpoints': nebula_endpoints,
+        'publisher.nebula.nebula_user': nebula_user,
+        'publisher.nebula.nebula_password': nebula_password,
+        'publisher.nebula.job_publish_tag': 'unique_tag',  # should use unique tag here like {ds}
+    })
+    job = DefaultJob(conf=job_config,
+                     task=task,
+                     publisher=NebulaCsvPublisher())
+    job.launch()
+
+def run_table_join_job(user_path, column_path, table_path, query_path, join_path):
+    tmp_folder = '/var/tmp/amundsen/table_join'
+    vertex_files_folder = f'{tmp_folder}/nodes'
+    edge_dir_files_folder = f'{tmp_folder}/relationships'
+    extractor = CsvTableQueryJoinExtractor()
+    csv_loader = FsNebulaCSVLoader()
+    task = DefaultTask(extractor,
+                       loader=csv_loader,
+                       transformer=NoopTransformer())
+    job_config = ConfigFactory.from_dict({
+        'extractor.csvtablequeryjoin.user_file_location': user_path,
+        'extractor.csvtablequeryjoin.column_file_location': column_path,
+        'extractor.csvtablequeryjoin.table_file_location': table_path,
+        'extractor.csvtablequeryjoin.query_file_location': query_path,
+        'extractor.csvtablequeryjoin.join_file_location': join_path,
+        'loader.filesystem_csv_nebula.vertex_dir_path': vertex_files_folder,
+        'loader.filesystem_csv_nebula.edge_dir_path': edge_dir_files_folder,
+        'loader.filesystem_csv_nebula.delete_created_directories': True,
+        'publisher.nebula.vertex_files_directory': vertex_files_folder,
+        'publisher.nebula.edge_files_directory': edge_dir_files_folder,
+        'publisher.nebula.nebula_endpoints': nebula_endpoints,
+        'publisher.nebula.nebula_user': nebula_user,
+        'publisher.nebula.nebula_password': nebula_password,
+        'publisher.nebula.job_publish_tag': 'unique_tag',  # should use unique tag here like {ds}
+    })
+    job = DefaultJob(conf=job_config,
+                     task=task,
+                     publisher=NebulaCsvPublisher())
+    job.launch()
+
+def run_table_where_job(user_path, column_path, table_path, query_path, where_path):
+    tmp_folder = '/var/tmp/amundsen/table_where'
+    vertex_files_folder = f'{tmp_folder}/nodes'
+    edge_dir_files_folder = f'{tmp_folder}/relationships'
+    extractor = CsvTableQueryWhereExtractor()
+    csv_loader = FsNebulaCSVLoader()
+    task = DefaultTask(extractor,
+                       loader=csv_loader,
+                       transformer=NoopTransformer())
+    job_config = ConfigFactory.from_dict({
+        'extractor.csvtablequerywhere.user_file_location': user_path,
+        'extractor.csvtablequerywhere.column_file_location': column_path,
+        'extractor.csvtablequerywhere.table_file_location': table_path,
+        'extractor.csvtablequerywhere.query_file_location': query_path,
+        'extractor.csvtablequerywhere.where_file_location': where_path,
+        'loader.filesystem_csv_nebula.vertex_dir_path': vertex_files_folder,
+        'loader.filesystem_csv_nebula.edge_dir_path': edge_dir_files_folder,
+        'loader.filesystem_csv_nebula.delete_created_directories': True,
+        'publisher.nebula.vertex_files_directory': vertex_files_folder,
+        'publisher.nebula.edge_files_directory': edge_dir_files_folder,
+        'publisher.nebula.nebula_endpoints': nebula_endpoints,
+        'publisher.nebula.nebula_user': nebula_user,
+        'publisher.nebula.nebula_password': nebula_password,
+        'publisher.nebula.job_publish_tag': 'unique_tag',  # should use unique tag here like {ds}
+    })
+    job = DefaultJob(conf=job_config,
+                     task=task,
+                     publisher=NebulaCsvPublisher())
+    job.launch()
+
+def run_table_execution_job(user_path, column_path, table_path, query_path, execution_path):
+    tmp_folder = '/var/tmp/amundsen/table_execution'
+    vertex_files_folder = f'{tmp_folder}/nodes'
+    edge_dir_files_folder = f'{tmp_folder}/relationships'
+    extractor = CsvTableQueryExecutionExtractor()
+    csv_loader = FsNebulaCSVLoader()
+    task = DefaultTask(extractor,
+                       loader=csv_loader,
+                       transformer=NoopTransformer())
+    job_config = ConfigFactory.from_dict({
+        'extractor.csvtablequeryexecution.user_file_location': user_path,
+        'extractor.csvtablequeryexecution.column_file_location': column_path,
+        'extractor.csvtablequeryexecution.table_file_location': table_path,
+        'extractor.csvtablequeryexecution.query_file_location': query_path,
+        'extractor.csvtablequeryexecution.execution_file_location': execution_path,
+        'loader.filesystem_csv_nebula.vertex_dir_path': vertex_files_folder,
+        'loader.filesystem_csv_nebula.edge_dir_path': edge_dir_files_folder,
+        'loader.filesystem_csv_nebula.delete_created_directories': True,
+        'publisher.nebula.vertex_files_directory': vertex_files_folder,
+        'publisher.nebula.edge_files_directory': edge_dir_files_folder,
+        'publisher.nebula.nebula_endpoints': nebula_endpoints,
+        'publisher.nebula.nebula_user': nebula_user,
+        'publisher.nebula.nebula_password': nebula_password,
+        'publisher.nebula.job_publish_tag': 'unique_tag',  # should use unique tag here like {ds}
+    })
+    job = DefaultJob(conf=job_config,
+                     task=task,
+                     publisher=NebulaCsvPublisher())
+    job.launch()
+
 def create_last_updated_job():
     # loader saves data to these folders and publisher reads it from here
     tmp_folder = '/var/tmp/amundsen/last_updated_data'
@@ -242,6 +364,10 @@ def create_last_updated_job():
 
 def _str_to_list(str_val):
     return str_val.split(',')
+
+
+def _str_to_bool(str_val):
+    return bool(strtobool(str_val))
 
 
 def create_dashboard_tables_job():
@@ -285,6 +411,47 @@ def create_dashboard_tables_job():
                       publisher=publisher)
 
 
+def create_application_job():
+    # loader saves data to these folders and publisher reads it from here
+    tmp_folder = '/var/tmp/amundsen/application'
+    vertex_files_folder = f'{tmp_folder}/nodes'
+    edge_dir_files_folder = f'{tmp_folder}/relationships'
+
+    csv_extractor = CsvExtractor()
+    csv_loader = FsNebulaCSVLoader()
+
+    generic_transformer = GenericTransformer()
+    dict_to_model_transformer = DictToModel()
+    transformer = ChainedTransformer(transformers=[generic_transformer, dict_to_model_transformer],
+                                     is_init_transformers=True)
+
+    task = DefaultTask(extractor=csv_extractor,
+                       loader=csv_loader,
+                       transformer=transformer)
+    publisher = NebulaCsvPublisher()
+
+    job_config = ConfigFactory.from_dict({
+        f'{csv_extractor.get_scope()}.file_location': 'example/sample_data/sample_application.csv',
+        f'{transformer.get_scope()}.{generic_transformer.get_scope()}.{FIELD_NAME}': 'generates_table',
+        f'{transformer.get_scope()}.{generic_transformer.get_scope()}.{CALLBACK_FUNCTION}': _str_to_bool,
+        f'{transformer.get_scope()}.{dict_to_model_transformer.get_scope()}.{MODEL_CLASS}':
+            'databuilder.models.application.Application',
+        f'{csv_loader.get_scope()}.vertex_dir_path': vertex_files_folder,
+        f'{csv_loader.get_scope()}.edge_dir_path': edge_dir_files_folder,
+        f'{csv_loader.get_scope()}.delete_created_directories': True,
+        f'{publisher.get_scope()}.vertex_files_directory': vertex_files_folder,
+        f'{publisher.get_scope()}.edge_files_directory': edge_dir_files_folder,
+        f'{publisher.get_scope()}.nebula_endpoints': nebula_endpoints,
+        f'{publisher.get_scope()}.nebula_user': nebula_user,
+        f'{publisher.get_scope()}.nebula_password': nebula_password,
+        f'{publisher.get_scope()}.job_publish_tag': 'unique_tag',  # should use unique tag here like {ds}
+    })
+
+    return DefaultJob(conf=job_config,
+                      task=task,
+                      publisher=publisher)
+
+
 if __name__ == "__main__":
     # Uncomment next line to get INFO level logging
     logging.basicConfig(level=logging.DEBUG)
@@ -305,8 +472,6 @@ if __name__ == "__main__":
                 'databuilder.models.table_column_usage.ColumnReader')
     run_csv_job('example/sample_data/sample_user.csv', 'test_user_metadata',
                 'databuilder.models.user.User')
-    run_csv_job('example/sample_data/sample_application.csv', 'test_application_metadata',
-                'databuilder.models.application.Application')
     run_csv_job('example/sample_data/sample_table_report.csv', 'test_report_metadata',
                 'databuilder.models.report.ResourceReport')
     run_csv_job('example/sample_data/sample_source.csv', 'test_source_metadata',
@@ -329,7 +494,39 @@ if __name__ == "__main__":
                 'databuilder.models.dashboard.dashboard_execution.DashboardExecution')
     run_csv_job('example/sample_data/sample_dashboard_last_modified.csv', 'test_dashboard_last_modified',
                 'databuilder.models.dashboard.dashboard_last_modified.DashboardLastModifiedTimestamp')
+    run_csv_job('example/sample_data/sample_dashboard_chart.csv', 'test_dashboard_chart',
+                'databuilder.models.dashboard.dashboard_chart.DashboardChart')
+    run_csv_job('example/sample_data/sample_feature_metadata.csv', 'test_feature_metadata',
+                'databuilder.models.feature.feature_metadata.FeatureMetadata')
+    run_csv_job('example/sample_data/sample_feature_generation_code.csv', 'test_feature_generation_code',
+                'databuilder.models.feature.feature_generation_code.FeatureGenerationCode')
+    run_csv_job('example/sample_data/sample_feature_watermark.csv', 'test_feature_watermark',
+                'databuilder.models.feature.feature_watermark.FeatureWatermark')
 
+    run_table_query_job('example/sample_data/sample_user.csv',
+        'example/sample_data/sample_col.csv',
+        'example/sample_data/sample_table.csv',
+        'example/sample_data/sample_table_query.csv')
+
+    run_table_join_job('example/sample_data/sample_user.csv',
+        'example/sample_data/sample_col.csv',
+        'example/sample_data/sample_table.csv',
+        'example/sample_data/sample_table_query.csv',
+        'example/sample_data/sample_table_query_join.csv')
+
+    run_table_where_job('example/sample_data/sample_user.csv',
+        'example/sample_data/sample_col.csv',
+        'example/sample_data/sample_table.csv',
+        'example/sample_data/sample_table_query.csv',
+        'example/sample_data/sample_table_query_where.csv')
+
+    run_table_execution_job('example/sample_data/sample_user.csv',
+        'example/sample_data/sample_col.csv',
+        'example/sample_data/sample_table.csv',
+        'example/sample_data/sample_table_query.csv',
+        'example/sample_data/sample_table_query_execution.csv')
+
+    create_application_job().launch()
     create_dashboard_tables_job().launch()
 
     create_last_updated_job().launch()

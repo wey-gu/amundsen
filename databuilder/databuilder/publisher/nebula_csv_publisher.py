@@ -16,13 +16,16 @@ from typing import Callable, List, Set, TypeVar
 
 import pandas
 from jinja2 import Template
-from nebula2.common.ttypes import ErrorCode
-from nebula2.Config import Config
-from nebula2.data.ResultSet import ResultSet
-from nebula2.gclient.net import ConnectionPool, Session
+from nebula3.common.ttypes import ErrorCode
+from nebula3.Config import Config
+from nebula3.data.ResultSet import ResultSet
+from nebula3.gclient.net import ConnectionPool, Session
 from pyhocon import ConfigFactory, ConfigTree
 
 from databuilder.publisher.base_publisher import Publisher
+from databuilder.models.badge import BadgeMetadata
+from databuilder.models.table_metadata import ColumnMetadata, TableMetadata, TagMetadata
+from databuilder.models.user import User as UserMetadata
 
 
 # Setting field_size_limit to solve the error below
@@ -47,7 +50,7 @@ NEBULA_INSERT_BATCHSIZE = "nebula_insert_batchsize"
 NEBULA_RETRY_NUMBER = "nebula_retry_number"
 
 LAST_UPDATED_EPOCH_MS = 'publisher_last_updated_epoch_ms'
-PUBLISHED_PROPERTY_NAME = 'published'
+PUBLISHED_PROPERTY_NAME = 'published_tag'
 JOB_PUBLISH_TAG = 'job_publish_tag'
 
 # CSV HEADER
@@ -90,6 +93,20 @@ DEFAULT_CONFIG = ConfigFactory.from_dict({
     NEBULA_VID_LENGTH: 256}
 )
 
+# Nebula Graph Index Fields
+# Key: tags to be indexed
+# Value: string of index fields body
+# ref:
+# "https://docs.nebula-graph.io/3.0.2/3.ngql-guide/14.native-index-statements/"
+# "1.create-native-index/#create_tagedge_type_indexes"
+NEBULA_INDEX_TAG_FIELDS = {
+    BadgeMetadata.BADGE_NODE_LABEL: "()",
+    ColumnMetadata.COLUMN_NODE_LABEL: "()",
+    TableMetadata.TABLE_NODE_LABEL: "()",
+    UserMetadata.USER_NODE_LABEL: f"({ UserMetadata.USER_NODE_IS_ACTIVE })",
+    TagMetadata.TAG_NODE_LABEL: f"({ TagMetadata.TAG_TYPE }(32))"
+}
+
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
 
@@ -113,13 +130,16 @@ def retry(backoff_sec: int = 1) -> T:
                 except Exception as e:
                     if attempts == _retry_num:
                         LOGGER.debug(
-                            "%s attempts of retry exceeded.", _retry_num)
+                            "[%s] %s attempts of retry exceeded.",
+                            fn.__name__,
+                            _retry_num)
                         raise e
                     else:
                         sleep = backoff_sec * 2 ** attempts + random.uniform(
-                            0, 1)
+                            0.8, 1.5)
                         LOGGER.debug(
-                            "Retried for %s times, sleeping for %s seconds...",
+                            "[%s] Retried for %s times, sleeping for %s seconds...",
+                            fn.__name__,
                             attempts,
                             sleep,
                         )
@@ -279,9 +299,22 @@ class NebulaCsvPublisher(Publisher):
         """
         )
         properties = self._ddl_props_body(vertex_record, TAG_REQUIRED_KEYS)
+        return template.render(TAG_KEY=vertex_record[TAG_KEY], PROPERTIES=properties)
 
-        return template.render(
-            TAG_KEY=vertex_record[TAG_KEY], PROPERTIES=properties)
+    def make_create_tag_index_command(self, tag: str) -> str:
+        """
+        To make a CREATE TAG INDEX command
+        :param tag:
+        :return:
+        """
+        template = Template(
+            """
+            CREATE TAG INDEX IF NOT EXISTS `{{ tag }}_index` ON `{{ tag }}` 
+            {{ index_body }};
+        """
+        )
+        index_body = NEBULA_INDEX_TAG_FIELDS[tag]
+        return template.render(tag=tag, index_body=index_body)
 
     def make_alter_tag_command(
             self, vertex_record: dict, cur_props: dict) -> str:
@@ -440,19 +473,44 @@ class NebulaCsvPublisher(Publisher):
             raise RuntimeError(f"Failed when altering tag schema: { query }")
 
     @retry()
+    def _create_tag_index(
+            self, session: Session, vertex_record: dict) -> ResultSet:
+        tag = vertex_record[TAG_KEY]
+        query = self.make_create_tag_index_command(tag).strip()
+        try:
+            LOGGER.debug("Query: %s", query)
+            r = session.execute(query)
+        except Exception as e:
+            LOGGER.exception(
+                "Create Tag Index failed when for TAG %s",
+                tag
+            )
+            raise e
+
+        if r.is_succeeded():
+            return r
+        else:
+            LOGGER.exception(
+                "Create Tag Index: %s with error %s", query, r.error_msg())
+            raise RuntimeError(f"Failed when creating tag index: { query }")
+
+    @retry()
     def _create_tag_schema(
             self, session: Session, vertex_record: dict) -> ResultSet:
         query = self.make_create_tag_command(vertex_record)
+        tag = vertex_record[TAG_KEY]
         try:
             LOGGER.debug("Query: %s", query)
             r = session.execute(query)
         except Exception as e:
             LOGGER.exception(
                 "CREATE Tag Schema failed when for TAG %s",
-                vertex_record[TAG_KEY],
+                tag,
             )
             raise e
-        if r.is_succeeded():
+        if tag in NEBULA_INDEX_TAG_FIELDS:
+            r_index = self._create_tag_index(session, vertex_record)
+        if r.is_succeeded() and r_index.is_succeeded():
             return r
         elif (r.error_code() == ErrorCode.E_EXECUTION_ERROR and
                 NEBULA_EXISTED in r.error_msg().lower()):
@@ -617,7 +675,7 @@ class NebulaCsvPublisher(Publisher):
         ]
         properties = ", ".join(property_list)
 
-        command_prefix = f"INSERT VERTEX `{ tag }` ({ properties }) VALUES"
+        command_prefix = f"INSERT VERTEX `{ tag }` ({ properties }) VALUES "
 
         prop_str_suffix = f',"{ self.publish_tag }",timestamp()'
 
@@ -683,10 +741,10 @@ class NebulaCsvPublisher(Publisher):
         properties = ", ".join(property_list)
 
         command_prefix = (
-            f"INSERT edge `{ edge_type }` ({ properties }) VALUES")
+            f"INSERT edge `{ edge_type }` ({ properties }) VALUES ")
 
         reverse_command_prefix = (
-            f"INSERT edge `{ reverse_edge_type }` ({ properties }) VALUES")
+            f"INSERT edge `{ reverse_edge_type }` ({ properties }) VALUES ")
 
         prop_str_suffix = f',"{ self.publish_tag }", timestamp()'
 
@@ -733,8 +791,8 @@ class NebulaCsvPublisher(Publisher):
 
             props.append(f"`{ prop_name }` { prop_type } NULL")
 
-        props.append(f"{PUBLISHED_PROPERTY_NAME} string NOT NULL")
-        props.append(f"{LAST_UPDATED_EPOCH_MS} timestamp NOT NULL")
+        props.append(f"{PUBLISHED_PROPERTY_NAME} string NULL")
+        props.append(f"{LAST_UPDATED_EPOCH_MS} timestamp NULL")
 
         return ", ".join(props)
 
