@@ -12,20 +12,37 @@ from databuilder.models.graph_serializable import (
     RELATION_REVERSE_TYPE, RELATION_START_KEY,
     RELATION_START_LABEL, RELATION_TYPE,
 )
+from databuilder.models.user import User as UserMetadata
+
+# Mandatory fields for Nebula Vertex
+NEBULA_VERTEX_MANDATORY_FIELDS = {
+    UserMetadata.USER_NODE_LABEL: {
+        "is_active": {
+            "type": UserMetadata.__init__.__annotations__["is_active"],
+            "Default": True}
+    }
+}
 
 
 def serialize_node(node: Optional[GraphNode]) -> Dict[str, Any]:
     if node is None:
         return {}
-
+    tag = node.label
     node_dict = {
-        NODE_LABEL: node.label,
+        NODE_LABEL: tag,
         NODE_KEY: node.key
     }
     for key, value in node.attributes.items():
         property_type = _get_property_type(value)
         formatted_key = f'{key}:{property_type}'
         node_dict[formatted_key] = value
+    if tag in NEBULA_VERTEX_MANDATORY_FIELDS:
+        for prop in NEBULA_VERTEX_MANDATORY_FIELDS[tag].keys():
+            if prop not in node_dict:
+                value = NEBULA_VERTEX_MANDATORY_FIELDS[tag][prop]["Default"]
+                property_type = _get_property_type(value)
+                formatted_key = f'{prop}:{property_type}'
+                node_dict[formatted_key] = value
     return node_dict
 
 
