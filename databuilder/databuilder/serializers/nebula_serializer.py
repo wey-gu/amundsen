@@ -19,7 +19,13 @@ NEBULA_VERTEX_MANDATORY_FIELDS = {
     UserMetadata.USER_NODE_LABEL: {
         "is_active": {
             "type": UserMetadata.__init__.__annotations__["is_active"],
-            "Default": True}
+            "Default": True},
+        "user_id": {
+            "type": str,
+            "Default": ""},
+        "manager_fullname": {
+            "type": str,
+            "Default": ""},
     }
 }
 
