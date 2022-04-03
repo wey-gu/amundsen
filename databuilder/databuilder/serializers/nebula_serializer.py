@@ -2,15 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import (
-    Any, Dict, Optional,
+    Any,
+    Dict,
+    Optional,
 )
 
 from databuilder.models.graph_node import GraphNode
 from databuilder.models.graph_relationship import GraphRelationship
 from databuilder.models.graph_serializable import (
-    NODE_KEY, NODE_LABEL, RELATION_END_KEY, RELATION_END_LABEL,
-    RELATION_REVERSE_TYPE, RELATION_START_KEY,
-    RELATION_START_LABEL, RELATION_TYPE,
+    NODE_KEY,
+    NODE_LABEL,
+    RELATION_END_KEY,
+    RELATION_END_LABEL,
+    RELATION_REVERSE_TYPE,
+    RELATION_START_KEY,
+    RELATION_START_LABEL,
+    RELATION_TYPE,
 )
 from databuilder.models.user import User as UserMetadata
 
@@ -19,13 +26,16 @@ NEBULA_VERTEX_MANDATORY_FIELDS = {
     UserMetadata.USER_NODE_LABEL: {
         "is_active": {
             "type": UserMetadata.__init__.__annotations__["is_active"],
-            "Default": True},
+            "Default": True
+        },
         "user_id": {
             "type": str,
-            "Default": ""},
+            "Default": ""
+        },
         "manager_fullname": {
             "type": str,
-            "Default": ""},
+            "Default": ""
+        },
     }
 }
 
@@ -34,10 +44,7 @@ def serialize_node(node: Optional[GraphNode]) -> Dict[str, Any]:
     if node is None:
         return {}
     tag = node.label
-    node_dict = {
-        NODE_LABEL: tag,
-        NODE_KEY: node.key
-    }
+    node_dict = {NODE_LABEL: tag, NODE_KEY: node.key}
     for key, value in node.attributes.items():
         property_type = _get_property_type(value)
         formatted_key = f'{key}:{property_type}'
@@ -59,9 +66,9 @@ def serialize_relationship(
 
     relationship_dict = {
         RELATION_START_KEY: relationship.start_key,
-        RELATION_START_LABEL+":string": relationship.start_label,
+        RELATION_START_LABEL + ":string": relationship.start_label,
         RELATION_END_KEY: relationship.end_key,
-        RELATION_END_LABEL+":string": relationship.end_label,
+        RELATION_END_LABEL + ":string": relationship.end_label,
         RELATION_TYPE: relationship.type,
         RELATION_REVERSE_TYPE: relationship.reverse_type,
     }

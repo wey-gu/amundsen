@@ -24,9 +24,10 @@ from pyhocon import ConfigFactory, ConfigTree
 
 from databuilder.publisher.base_publisher import Publisher
 from databuilder.models.badge import BadgeMetadata
+from databuilder.models.dashboard.dashboard_metadata import DashboardMetadata
+from databuilder.models.feature.feature_metadata import FeatureMetadata
 from databuilder.models.table_metadata import ColumnMetadata, TableMetadata, TagMetadata
 from databuilder.models.user import User as UserMetadata
-
 
 # Setting field_size_limit to solve the error below
 # _csv.Error: field larger than field limit (131072)
@@ -77,10 +78,7 @@ EDGE_TYPE = "TYPE"
 EDGE_REVERSE_TYPE = "REVERSE_TYPE"
 # Required columns for Edge
 EDGE_REQUIRED_KEYS = {
-    EDGE_START_KEY,
-    EDGE_END_KEY,
-    EDGE_TYPE,
-    EDGE_REVERSE_TYPE
+    EDGE_START_KEY, EDGE_END_KEY, EDGE_TYPE, EDGE_REVERSE_TYPE
 }
 NEBULA_EXISTED = "existed"
 NEBULA_UNQUOTED_TYPES = {"int64", "float", "bool"}
@@ -90,8 +88,8 @@ DEFAULT_CONFIG = ConfigFactory.from_dict({
     NEBULA_INSERT_BATCHSIZE: 64,
     NEBULA_RETRY_NUMBER: 4,
     NEBULA_MAX_CONN_POOL_SIZE: 10,
-    NEBULA_VID_LENGTH: 256}
-)
+    NEBULA_VID_LENGTH: 256
+})
 
 # Nebula Graph Index Fields
 # Key: tags to be indexed
@@ -104,7 +102,9 @@ NEBULA_INDEX_TAG_FIELDS = {
     ColumnMetadata.COLUMN_NODE_LABEL: "()",
     TableMetadata.TABLE_NODE_LABEL: "()",
     UserMetadata.USER_NODE_LABEL: f"({ UserMetadata.USER_NODE_IS_ACTIVE })",
-    TagMetadata.TAG_NODE_LABEL: f"({ TagMetadata.TAG_TYPE }(32))"
+    TagMetadata.TAG_NODE_LABEL: f"({ TagMetadata.TAG_TYPE }(32))",
+    DashboardMetadata.DASHBOARD_NODE_LABEL: "()",
+    FeatureMetadata.NODE_LABEL: "()"
 }
 
 LOGGER = logging.getLogger(__name__)
@@ -119,6 +119,7 @@ def retry(backoff_sec: int = 1) -> T:
     """
 
     def decorator_retry(fn):
+
         @wraps(fn)
         def fn_retry(*args, **kwargs):
             attempts = 0
@@ -129,13 +130,11 @@ def retry(backoff_sec: int = 1) -> T:
                     return fn(*args, **kwargs)
                 except Exception as e:
                     if attempts == _retry_num:
-                        LOGGER.debug(
-                            "[%s] %s attempts of retry exceeded.",
-                            fn.__name__,
-                            _retry_num)
+                        LOGGER.debug("[%s] %s attempts of retry exceeded.",
+                                     fn.__name__, _retry_num)
                         raise e
                     else:
-                        sleep = backoff_sec * 2 ** attempts + random.uniform(
+                        sleep = backoff_sec * 2**attempts + random.uniform(
                             0.8, 1.5)
                         LOGGER.debug(
                             "[%s] Retried for %s times, sleeping for %s seconds...",
@@ -177,8 +176,7 @@ class NebulaCsvPublisher(Publisher):
         self._nebula_space = conf.get_string(NEBULA_SPACE)
         self._nebula_max_conn_pool_size = conf.get_int(
             NEBULA_MAX_CONN_POOL_SIZE)
-        self._nebula_vid_length = conf.get_int(
-            NEBULA_VID_LENGTH)
+        self._nebula_vid_length = conf.get_int(NEBULA_VID_LENGTH)
         self._nebula_endpoints = conf.get_string(NEBULA_ENDPOINTS)
         self._nebula_credential = (
             conf.get_string(NEBULA_USER),
@@ -202,9 +200,8 @@ class NebulaCsvPublisher(Publisher):
         connection_pool = ConnectionPool()
         config = Config()
         config.max_connection_pool_size = self._nebula_max_conn_pool_size
-        nebula_endpoints = [
-            (e.split(":")[0], int(e.split(":")[1]))
-                for e in self._nebula_endpoints.split(",") if e]
+        nebula_endpoints = [(e.split(":")[0], int(e.split(":")[1]))
+                            for e in self._nebula_endpoints.split(",") if e]
 
         connection_pool.init(nebula_endpoints, config)
         with connection_pool.session_context(
@@ -269,17 +266,16 @@ class NebulaCsvPublisher(Publisher):
                     except StopIteration:
                         break
 
-                LOGGER.info(
-                    "Importing data in edge files: %s", self._edge_files)
+                LOGGER.info("Importing data in edge files: %s",
+                            self._edge_files)
                 while True:
                     try:
                         edge_file = next(self._edge_files_iter)
                         self._import_edges(edge_file, session=session)
                     except StopIteration:
                         break
-                LOGGER.info(
-                    "Successfully published. Elapsed: %i seconds",
-                    time.time() - start)
+                LOGGER.info("Successfully published. Elapsed: %i seconds",
+                            time.time() - start)
             except Exception as e:
                 LOGGER.exception("Failed to publish.")
                 raise e
@@ -293,13 +289,12 @@ class NebulaCsvPublisher(Publisher):
         :param vertex_record:
         :return:
         """
-        template = Template(
-            """
+        template = Template("""
             CREATE TAG `{{ TAG_KEY }}`({{ PROPERTIES }});
-        """
-        )
+        """)
         properties = self._ddl_props_body(vertex_record, TAG_REQUIRED_KEYS)
-        return template.render(TAG_KEY=vertex_record[TAG_KEY], PROPERTIES=properties)
+        return template.render(TAG_KEY=vertex_record[TAG_KEY],
+                               PROPERTIES=properties)
 
     def make_create_tag_index_command(self, tag: str) -> str:
         """
@@ -307,17 +302,15 @@ class NebulaCsvPublisher(Publisher):
         :param tag:
         :return:
         """
-        template = Template(
-            """
+        template = Template("""
             CREATE TAG INDEX IF NOT EXISTS `{{ tag }}_index` ON `{{ tag }}` 
             {{ index_body }};
-        """
-        )
+        """)
         index_body = NEBULA_INDEX_TAG_FIELDS[tag]
         return template.render(tag=tag, index_body=index_body)
 
-    def make_alter_tag_command(
-            self, vertex_record: dict, cur_props: dict) -> str:
+    def make_alter_tag_command(self, vertex_record: dict,
+                               cur_props: dict) -> str:
         """
         To make a ALTER TAG command
         :param vertex_record:
@@ -337,8 +330,7 @@ class NebulaCsvPublisher(Publisher):
         outdated = list(set(cur_props.items()) - set(target.items()))
         deleted = [el for el in outdated if el[0] not in target]
 
-        template = Template(
-            """
+        template = Template("""
             {%- if changed %}ALTER TAG `{{ TAG_KEY }}` CHANGE(
                 {%- for el in changed %}`{{ el[0] }}` {{ el[1] }} NULL \
                     {{- ", " if not loop.last else "" }}
@@ -354,8 +346,7 @@ class NebulaCsvPublisher(Publisher):
                     {{- ", " if not loop.last else "" }}
                 {%- endfor %});
             {%- endif %}
-        """
-        )
+        """)
 
         return template.render(
             TAG_KEY=vertex_record[TAG_KEY],
@@ -370,18 +361,16 @@ class NebulaCsvPublisher(Publisher):
         :param edge_record:
         :return:
         """
-        template = Template(
-            """
+        template = Template("""
             CREATE EDGE `{{ EDGE_TYPE }}`({{ PROPERTIES }});
-        """
-        )
+        """)
         properties = self._ddl_props_body(edge_record, EDGE_REQUIRED_KEYS)
 
-        return template.render(
-            EDGE_TYPE=edge_record[EDGE_TYPE], PROPERTIES=properties)
+        return template.render(EDGE_TYPE=edge_record[EDGE_TYPE],
+                               PROPERTIES=properties)
 
-    def make_alter_edgetype_command(
-            self, edge_record: dict, cur_props: dict) -> str:
+    def make_alter_edgetype_command(self, edge_record: dict,
+                                    cur_props: dict) -> str:
         """
         To make a ALTER EDGE command
         :param edge_record:
@@ -401,8 +390,7 @@ class NebulaCsvPublisher(Publisher):
         outdated = list(set(cur_props.items()) - set(target.items()))
         deleted = [el for el in outdated if el[0] not in target]
 
-        template = Template(
-            """
+        template = Template("""
             {%- if changed %}ALTER EDGE `{{ EDGE_TYPE }}` CHANGE(
                 {%- for el in changed %}`{{ el[0] }}` {{ el[1] }} NULL \
                     {{- ", " if not loop.last else "" }}
@@ -418,8 +406,7 @@ class NebulaCsvPublisher(Publisher):
                     {{- ", " if not loop.last else "" }}
                 {%- endfor %});
             {%- endif %}\
-        """
-        )
+        """)
 
         return template.render(
             EDGE_TYPE=edge_record[EDGE_TYPE],
@@ -428,12 +415,11 @@ class NebulaCsvPublisher(Publisher):
             deleted=deleted,
         )
 
-    def _alter_tag_schema(
-            self, session: Session, vertex_record: dict) -> ResultSet:
+    def _alter_tag_schema(self, session: Session,
+                          vertex_record: dict) -> ResultSet:
         try:
             r_json_string = session.execute_json(
-                f"DESCRIBE TAG `{ vertex_record[TAG_KEY] }`;"
-            ).decode("utf-8")
+                f"DESCRIBE TAG `{ vertex_record[TAG_KEY] }`;").decode("utf-8")
 
             cur_propertices = {
                 p["row"][0]: p["row"][1]
@@ -442,9 +428,7 @@ class NebulaCsvPublisher(Publisher):
         except Exception as e:
             LOGGER.exception(
                 "Alter Tag Schema failed when getting existing TAG %s,\n%s",
-                vertex_record[TAG_KEY],
-                r_json_string
-            )
+                vertex_record[TAG_KEY], r_json_string)
             raise e
 
         cur_propertices.pop(PUBLISHED_PROPERTY_NAME, None)
@@ -458,45 +442,39 @@ class NebulaCsvPublisher(Publisher):
             LOGGER.debug("Query: %s", query)
             r = session.execute(query)
         except Exception as e:
-            LOGGER.exception(
-                "Alter Tag Schema failed when for TAG %s,\n%s",
-                vertex_record[TAG_KEY],
-                str(cur_propertices)
-            )
+            LOGGER.exception("Alter Tag Schema failed when for TAG %s,\n%s",
+                             vertex_record[TAG_KEY], str(cur_propertices))
             raise e
 
         if r.is_succeeded():
             return r
         else:
-            LOGGER.exception(
-                "Alter Tag Schema: %s with error %s", query, r.error_msg())
+            LOGGER.exception("Alter Tag Schema: %s with error %s", query,
+                             r.error_msg())
             raise RuntimeError(f"Failed when altering tag schema: { query }")
 
     @retry()
-    def _create_tag_index(
-            self, session: Session, vertex_record: dict) -> ResultSet:
+    def _create_tag_index(self, session: Session,
+                          vertex_record: dict) -> ResultSet:
         tag = vertex_record[TAG_KEY]
         query = self.make_create_tag_index_command(tag).strip()
         try:
             LOGGER.debug("Query: %s", query)
             r = session.execute(query)
         except Exception as e:
-            LOGGER.exception(
-                "Create Tag Index failed when for TAG %s",
-                tag
-            )
+            LOGGER.exception("Create Tag Index failed when for TAG %s", tag)
             raise e
 
         if r.is_succeeded():
             return r
         else:
-            LOGGER.exception(
-                "Create Tag Index: %s with error %s", query, r.error_msg())
+            LOGGER.exception("Create Tag Index: %s with error %s", query,
+                             r.error_msg())
             raise RuntimeError(f"Failed when creating tag index: { query }")
 
     @retry()
-    def _create_tag_schema(
-            self, session: Session, vertex_record: dict) -> ResultSet:
+    def _create_tag_schema(self, session: Session,
+                           vertex_record: dict) -> ResultSet:
         query = self.make_create_tag_command(vertex_record)
         tag = vertex_record[TAG_KEY]
         try:
@@ -512,21 +490,20 @@ class NebulaCsvPublisher(Publisher):
             r_index = self._create_tag_index(session, vertex_record)
         if r.is_succeeded() and r_index.is_succeeded():
             return r
-        elif (r.error_code() == ErrorCode.E_EXECUTION_ERROR and
-                NEBULA_EXISTED in r.error_msg().lower()):
-            return self._alter_tag_schema(
-                session=session, vertex_record=vertex_record)
+        elif (r.error_code() == ErrorCode.E_EXECUTION_ERROR
+              and NEBULA_EXISTED in r.error_msg().lower()):
+            return self._alter_tag_schema(session=session,
+                                          vertex_record=vertex_record)
         else:
-            LOGGER.exception(
-                "Create tag schema: %s with error %s", query, r.error_msg())
+            LOGGER.exception("Create tag schema: %s with error %s", query,
+                             r.error_msg())
             raise RuntimeError(f"Failed when creating tag schema: { query }")
 
-    def _alter_edgetype_schema(
-            self, session: Session, edge_record: dict) -> ResultSet:
+    def _alter_edgetype_schema(self, session: Session,
+                               edge_record: dict) -> ResultSet:
         try:
             r_json_string = session.execute_json(
-                f"DESCRIBE EDGE `{ edge_record[EDGE_TYPE] }`;"
-            ).decode("utf-8")
+                f"DESCRIBE EDGE `{ edge_record[EDGE_TYPE] }`;").decode("utf-8")
 
             cur_propertices = {
                 p["row"][0]: p["row"][1]
@@ -536,9 +513,7 @@ class NebulaCsvPublisher(Publisher):
         except Exception as e:
             LOGGER.exception(
                 "Alter Edge Schema failed when getting existing EDGE %s,\n%s",
-                edge_record[EDGE_TYPE],
-                r_json_string
-            )
+                edge_record[EDGE_TYPE], r_json_string)
             raise e
 
         cur_propertices.pop(PUBLISHED_PROPERTY_NAME, None)
@@ -552,23 +527,20 @@ class NebulaCsvPublisher(Publisher):
             LOGGER.debug("Query: %s", query)
             r = session.execute(query)
         except Exception as e:
-            LOGGER.exception(
-                "Alter Edge Schema failed for ALTER EDGE %s,\n%s",
-                edge_record[TAG_KEY],
-                str(cur_propertices)
-            )
+            LOGGER.exception("Alter Edge Schema failed for ALTER EDGE %s,\n%s",
+                             edge_record[TAG_KEY], str(cur_propertices))
             raise e
 
         if r.is_succeeded():
             return r
         else:
-            LOGGER.exception(
-                "Alter Edge Schema: %s with error %s", query, r.error_msg())
+            LOGGER.exception("Alter Edge Schema: %s with error %s", query,
+                             r.error_msg())
             raise RuntimeError(f"Failed when altering edge schema: { query }")
 
     @retry()
-    def _create_edgetype_schema(
-            self, session: Session, edge_record: dict) -> None:
+    def _create_edgetype_schema(self, session: Session,
+                                edge_record: dict) -> None:
         query = self.make_create_edgetype_command(edge_record)
         try:
             LOGGER.debug("Query: %s", query)
@@ -581,14 +553,13 @@ class NebulaCsvPublisher(Publisher):
             raise e
         if r.is_succeeded():
             return r
-        elif (r.error_code() == ErrorCode.E_EXECUTION_ERROR and
-                NEBULA_EXISTED in r.error_msg().lower()):
-            return self._alter_edgetype_schema(
-                session=session, edge_record=edge_record)
+        elif (r.error_code() == ErrorCode.E_EXECUTION_ERROR
+              and NEBULA_EXISTED in r.error_msg().lower()):
+            return self._alter_edgetype_schema(session=session,
+                                               edge_record=edge_record)
         else:
-            LOGGER.exception(
-                "Create edge type schema: %s with error %s",
-                query, r.error_msg())
+            LOGGER.exception("Create edge type schema: %s with error %s",
+                             query, r.error_msg())
             raise RuntimeError(
                 f"Failed when creating edge type schema: { query }")
 
@@ -603,8 +574,7 @@ class NebulaCsvPublisher(Publisher):
         for vertex_file in self._vertex_files:
             with open(vertex_file, "r", encoding="utf8") as vertex_csv:
                 for vertex_record in pandas.read_csv(
-                    vertex_csv, na_filter=False
-                ).to_dict(orient="records"):
+                        vertex_csv, na_filter=False).to_dict(orient="records"):
                     tag = vertex_record[TAG_KEY]
                     if tag not in self.tags:
                         self._create_tag_schema(session, vertex_record)
@@ -615,9 +585,7 @@ class NebulaCsvPublisher(Publisher):
         for edge_file in self._edge_files:
             with open(edge_file, "r", encoding="utf8") as edge_csv:
                 for edge_record in pandas.read_csv(
-                    edge_csv, na_filter=False).to_dict(
-                    orient="records"
-                ):
+                        edge_csv, na_filter=False).to_dict(orient="records"):
                     edge_type = edge_record[EDGE_TYPE]
                     if edge_type not in self.edge_types:
                         self._create_edgetype_schema(session, edge_record)
@@ -625,9 +593,9 @@ class NebulaCsvPublisher(Publisher):
                     reverse_edge_type = edge_record[EDGE_REVERSE_TYPE]
                     if reverse_edge_type not in self.edge_types:
                         (edge_record[EDGE_TYPE],
-                            edge_record[EDGE_REVERSE_TYPE]) = (
-                                edge_record[EDGE_REVERSE_TYPE],
-                                edge_record[EDGE_TYPE])
+                         edge_record[EDGE_REVERSE_TYPE]) = (
+                             edge_record[EDGE_REVERSE_TYPE],
+                             edge_record[EDGE_TYPE])
                         self._create_edgetype_schema(session, edge_record)
                         self.edge_types.add(reverse_edge_type)
 
@@ -646,9 +614,7 @@ class NebulaCsvPublisher(Publisher):
         with open(vertex_file, "r", encoding="utf8") as vertex_csv:
             csv_buffer = list()
             for vertex_record in pandas.read_csv(
-                vertex_csv, na_filter=False).to_dict(
-                orient="records"
-            ):
+                    vertex_csv, na_filter=False).to_dict(orient="records"):
                 csv_buffer.append(vertex_record)
                 if len(csv_buffer) > self._nebula_insert_batchsize:
                     query = self.make_insert_vertex_command(
@@ -682,8 +648,8 @@ class NebulaCsvPublisher(Publisher):
         formated_records = list()
         for rec in vertex_records:
             prop_list = [self.formated_prop(p, rec[p]) for p in prop_keys]
-            formated_records.append((
-                rec[VID_KEY], ",".join(prop_list) + prop_str_suffix))
+            formated_records.append(
+                (rec[VID_KEY], ",".join(prop_list) + prop_str_suffix))
 
         template = Template("""
             {%- for r in RECORDS %} "{{ r[0] }}":({{ r[1] }})
@@ -710,9 +676,7 @@ class NebulaCsvPublisher(Publisher):
         with open(edge_file, "r", encoding="utf8") as edge_csv:
             csv_buffer = list()
             for edge_record in pandas.read_csv(
-                edge_csv, na_filter=False).to_dict(
-                orient="records"
-            ):
+                    edge_csv, na_filter=False).to_dict(orient="records"):
                 csv_buffer.append(edge_record)
                 if len(csv_buffer) > self._nebula_insert_batchsize:
                     query = self.make_insert_edge_command(
@@ -720,8 +684,7 @@ class NebulaCsvPublisher(Publisher):
                     self._execute_query(query, session)
                     del csv_buffer[:]
             if csv_buffer:
-                query = self.make_insert_edge_command(
-                    edge_records=csv_buffer)
+                query = self.make_insert_edge_command(edge_records=csv_buffer)
                 self._execute_query(query, session)
                 del csv_buffer[:]
         return
@@ -751,10 +714,8 @@ class NebulaCsvPublisher(Publisher):
         formated_records = list()
         for rec in edge_records:
             prop_list = [self.formated_prop(p, rec[p]) for p in prop_keys]
-            formated_records.append((
-                rec[EDGE_START_KEY],
-                rec[EDGE_END_KEY],
-                ",".join(prop_list) + prop_str_suffix))
+            formated_records.append((rec[EDGE_START_KEY], rec[EDGE_END_KEY],
+                                     ",".join(prop_list) + prop_str_suffix))
 
         template = Template("""
             {%- for r in RECORDS %}"{{ r[0] }}"->"{{ r[1] }}":({{ r[2] }})
