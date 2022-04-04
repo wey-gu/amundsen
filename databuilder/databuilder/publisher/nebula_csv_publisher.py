@@ -95,8 +95,7 @@ DEFAULT_CONFIG = ConfigFactory.from_dict({
 # Key: tags to be indexed
 # Value: string of index fields body
 # ref:
-# "https://docs.nebula-graph.io/3.0.2/3.ngql-guide/14.native-index-statements/"
-# "1.create-native-index/#create_tagedge_type_indexes"
+# "https://docs.nebula-graph.io/3.0.2/3.ngql-guide/14.native-index-statements/1.create-native-index/#create_tagedge_type_indexes"
 NEBULA_INDEX_TAG_FIELDS = {
     BadgeMetadata.BADGE_NODE_LABEL: "()",
     ColumnMetadata.COLUMN_NODE_LABEL: "()",
@@ -118,7 +117,7 @@ def retry(backoff_sec: int = 1) -> T:
     :param backoff_sec: The time in second per each backoff step.
     """
 
-    def decorator_retry(fn):
+    def decorator_retry(fn: Callable[..., T]) -> Callable[..., T]:
 
         @wraps(fn)
         def fn_retry(*args, **kwargs):
