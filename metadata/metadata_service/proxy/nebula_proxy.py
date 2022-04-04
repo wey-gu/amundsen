@@ -38,7 +38,7 @@ from beaker.cache import CacheManager
 from beaker.util import parse_cache_config_options
 from flask import current_app, has_app_context
 from jinja2 import Template
-from nebula3.common.ttypes import ErrorCode, Value as NebulaValue
+from nebula3.common.ttypes import Value as NebulaValue
 from nebula3.Config import Config as NebulaConfig
 from nebula3.gclient.net import ConnectionPool, Session
 
@@ -84,12 +84,13 @@ class NebulaProxy(BaseProxy):
 
     def __init__(self,
                  *,
-                 hosts: list,
-                 space: str,
+                 host: str,
+                 port: int,
                  user: str,
                  password: str,
                  num_conns: int = 100,
                  query_timeout_sec: int = 100,
+                 space: str = "amundsen",
                  **kwargs: dict) -> None:
         """
         By default, it will set max number of connections to 100 and connection time out to 100 seconds.
@@ -98,13 +99,14 @@ class NebulaProxy(BaseProxy):
         than surrounding network environment's timeout.
         ToDo: TLS support.
         """
-        LOGGER.info('Nebula endpoint: {}'.format(str(hosts)))
+        LOGGER.info('Nebula endpoint: {}'.format(str(host)))
+        hosts = host.split(",")
         self.config = NebulaConfig()
         self.config.timeout = query_timeout_sec * 1000
         self.config.max_connection_pool_size = num_conns
 
         self._connection_pool = ConnectionPool()
-        self._connection_pool.init([(h[0], h[1]) for h in hosts], self.config)
+        self._connection_pool.init([(h, port) for h in hosts], self.config)
         self._queue = queue.Queue()
         for c in range(num_conns):
             session = self._connection_pool.get_session(user, password)
@@ -119,8 +121,8 @@ class NebulaProxy(BaseProxy):
                     f"Failed to switch graph space {space}")
             self._queue.put(session)
 
-    @contextmanager()
-    def get_session(self):
+    @contextmanager
+    def get_session(self) -> Session:
         session = self._queue.get()
         try:
             yield session
@@ -212,6 +214,8 @@ class NebulaProxy(BaseProxy):
         Format a record from a query result to remove Nebula Graph Tag
         from the property name
         """
+        if not record:
+            return
         del_keys = []
         for key, value in record.items():
             if key.startswith(f"{ tag_name }."):
@@ -415,8 +419,10 @@ class NebulaProxy(BaseProxy):
         meta = table_record[0]['meta']
 
         wmk_records, wmk_meta = record[i_wmk_records], meta[i_wmk_records]
-        producing_apps = record[i_producing_apps]
-        consuming_apps = record[i_consuming_apps]
+        producing_apps, producing_apps_meta = record[i_producing_apps], meta[
+            i_producing_apps]
+        consuming_apps, consuming_apps_meta = record[i_consuming_apps], meta[
+            i_consuming_apps]
         last_updated_timestamp = record[i_last_updated_timestamp]
         owner_records = record[i_owner_records]
         tag_records, tag_meta = record[i_tag_records], meta[i_tag_records]
@@ -445,8 +451,9 @@ class NebulaProxy(BaseProxy):
         # this is for any badges added with BadgeAPI instead of TagAPI
         badges = self._make_badges(badge_records, badge_meta)
 
-        table_writer, table_apps = self._create_apps(producing_apps,
-                                                     consuming_apps)
+        table_writer, table_apps = self._create_apps(
+            (producing_apps, producing_apps_meta),
+            (consuming_apps, consuming_apps_meta))
 
         timestamp_value = last_updated_timestamp
 
@@ -626,15 +633,15 @@ class NebulaProxy(BaseProxy):
         :return:
         """
         result_dict = json.loads(raw_data)
-        return result_dict['results',
-                           []], result_dict.get('errors',
+        return result_dict.get('results',
+                           []), result_dict.get('errors',
                                                 [{}])[0].get('code', -1)
 
     @timer_with_counter
     def _execute_query(self, query: str, param_dict: Dict[str, Any]) -> List:
         """
         :param query:
-        :param session:
+        :param param_dict:
         :return:
         """
         with self.get_session() as session:
@@ -1454,9 +1461,9 @@ class NebulaProxy(BaseProxy):
         user_record = data[0]['row'][i_user_record]
         manager_record = data[0]['row'][i_manager_record]
         self._format_record(user_record, ResourceType.User.name)
-        self._format_record(manager_record, ResourceType.User.name)
 
         if manager_record:
+            self._format_record(manager_record, ResourceType.User.name)
             manager_name = manager_record.get('full_name', '')
         else:
             manager_name = ''
@@ -2078,6 +2085,20 @@ class NebulaProxy(BaseProxy):
             resource_type=ResourceType.Dashboard, uri=id)
 
     @timer_with_counter
+    def put_dashboard_description(self, *,
+                                  id: str,
+                                  description: str) -> None:
+        """
+        Update Dashboard description
+        :param id: Dashboard URI
+        :param description: new value for Dashboard description
+        """
+
+        self.put_resource_description(resource_type=ResourceType.Dashboard,
+                                      uri=id,
+                                      description=description)
+
+    @timer_with_counter
     def get_resources_using_table(
             self, *, id: str,
             resource_type: ResourceType) -> Dict[str, List[DashboardSummary]]:
@@ -2356,33 +2377,42 @@ class NebulaProxy(BaseProxy):
                      or owner.get('User.user_id', None), ))
         return owners
 
-    def _create_app(self, app_record: dict, kind: str) -> Application:
+    def _create_app(self, app_record: dict, kind: str, id: str) -> Application:
         return Application(
             name=app_record['Application.name'],
-            id=app_record['Application.id'],
+            id=id,
             application_url=app_record['Application.application_url'],
             description=app_record.get('Application.description'),
             kind=kind,
         )
 
     def _create_apps(
-            self, producing_app_records: List, consuming_app_records: List
+        self, producing_app_records: Tuple[List],
+        consuming_app_records: Tuple[List]
     ) -> Tuple[Application, List[Application]]:
 
         table_apps = []
-        for record in producing_app_records:
-            table_apps.append(self._create_app(record, kind='Producing'))
+        producing_records, producing_meta = producing_app_records
+        for i, record in enumerate(producing_records):
+            table_apps.append(
+                self._create_app(record,
+                                 kind='Producing',
+                                 id=producing_meta[i].get('id')))
 
         # for bw compatibility, we populate table_writer with one of the producing apps
         table_writer = table_apps[0] if table_apps else None
 
         _producing_app_ids = {app.id for app in table_apps}
-        for record in consuming_app_records:
+        consuming_records, consuming_meta = consuming_app_records
+
+        for i, record in enumerate(consuming_records):
             # if an app has both a consuming and producing relationship with a table
             # (e.g. an app that reads writes back to its input table), we call it a Producing app and
             # do not add it again
-            if record['id'] not in _producing_app_ids:
-                table_apps.append(self._create_app(record, kind='Consuming'))
+            record_id = consuming_meta[i].get('id')
+            if record_id not in _producing_app_ids:
+                table_apps.append(
+                    self._create_app(record, kind='Consuming', id=record_id))
 
         return table_writer, table_apps
 
