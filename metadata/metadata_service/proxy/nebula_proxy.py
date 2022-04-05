@@ -31,7 +31,7 @@ from amundsen_common.models.table import (Application, Badge, Column,
                                           ProgrammaticDescription, Reader,
                                           ResourceReport, Source, SqlJoin,
                                           SqlWhere, Stat, Table, TableSummary,
-                                          Tag, User, Watermark)
+                                          Tag, TypeMetadata, User, Watermark)
 from amundsen_common.models.user import User as UserEntity
 from amundsen_common.models.user import UserSchema
 from beaker.cache import CacheManager
@@ -264,6 +264,8 @@ class NebulaProxy(BaseProxy):
                       source=source,
                       is_view=table_last[3].get('Table.is_view', None),
                       programmatic_descriptions=prog_descs,
+                      common_joins=joins,
+                      common_filters=filters,
                       resource_reports=resource_reports)
 
         return table
@@ -284,10 +286,34 @@ class NebulaProxy(BaseProxy):
         RETURN db, clstr, schema, tbl, tbl_dscrpt, col, col_dscrpt, collect(distinct stat) AS col_stats,
         collect(distinct badge) AS col_badges, col.Column.sort_order AS sort_order
         ORDER BY sort_order;"""))
+        # ToDo: support
+        # column_level_query = Template(
+        #     textwrap.dedent("""
+        # MATCH (db:Database)-[:CLUSTER]->(clstr:Cluster)-[:SCHEMA]->(schema:Schema)
+        # -[:TABLE]->(tbl:Table)-[:COLUMN]->(col:Column)
+        # WHERE id(tbl) == "{{ vid }}"
+        # OPTIONAL MATCH (tbl)-[:DESCRIPTION]->(tbl_dscrpt:Description)
+        # OPTIONAL MATCH (col:Column)-[:DESCRIPTION]->(col_dscrpt:Description)
+        # OPTIONAL MATCH (col:Column)-[:STAT]->(stat:Stat)
+        # OPTIONAL MATCH (col:Column)-[:HAS_BADGE]->(badge:Badge)
+        # OPTIONAL MATCH (col:Column)-[:TYPE_METADATA]->(Type_Metadata)-[:SUBTYPE *0..]->(tm:Type_Metadata)
+        # OPTIONAL MATCH (tm:Type_Metadata)-[:DESCRIPTION]->(tm_dscrpt:Description)
+        # OPTIONAL MATCH (tm:Type_Metadata)-[:HAS_BADGE]->(tm_badge:Badge)
+        # WITH db, clstr, schema, tbl, tbl_dscrpt, col, col_dscrpt, collect(distinct stat) AS col_stats,
+        # collect(distinct badge) AS col_badges, col.Column.sort_order AS sort_order,
+        # {node: tm, description: tm_dscrpt, badges: collect(distinct tm_badge)} AS tm_results
+        # RETURN db, clstr, schema, tbl, tbl_dscrpt, col, col_dscrpt, col_stats, col_badges,
+        # collect(distinct tm_results) AS col_type_metadata
+        # ORDER BY sort_order;"""))
 
         tbl_col_nebula_records = self._execute_query(
             query=column_level_query.render(vid=table_uri), param_dict={})[0]
         cols = []
+
+        # (i_col_stats, i_col_badges, i_col, i_col_dscrpt,
+        #  i_col_type_metadata) = self._get_result_column_indexes(
+        #      tbl_col_nebula_records, ('col_stats', 'col_badges', 'col',
+        #                               'col_dscrpt', 'col_type_metadata'))
 
         (i_col_stats, i_col_badges, i_col,
          i_col_dscrpt) = self._get_result_column_indexes(
@@ -307,6 +333,11 @@ class NebulaProxy(BaseProxy):
             column_badges = self._make_badges(record['row'][i_col_badges],
                                               record['meta'][i_col_badges])
 
+            col_type_metadata = []
+            # col_type_metadata = self._get_type_metadata(
+            #     record['row'][i_col_type_metadata],
+            #     record['meta'][i_col_type_metadata])
+
             col = Column(name=record['row'][i_col]['Column.name'],
                          description=record['row'][i_col_dscrpt].get(
                              'Description.description', None),
@@ -314,7 +345,8 @@ class NebulaProxy(BaseProxy):
                          sort_order=int(
                              record['row'][i_col]['Column.sort_order']),
                          stats=col_stats,
-                         badges=column_badges)
+                         badges=column_badges,
+                         type_metadata=col_type_metadata)
 
             cols.append(col)
 
@@ -324,6 +356,38 @@ class NebulaProxy(BaseProxy):
         table = record['row']
 
         return sorted(cols, key=lambda item: item.sort_order), table
+
+    def _get_type_metadata(self, type_metadata_results: List,
+                           type_metadata_meta: List) -> Optional[TypeMetadata]:
+        """
+        Generates a TypeMetadata object for a column. All columns will have at least
+        one associated type metadata node if the ComplexTypeTransformer is configured
+        to transform table metadata. Otherwise, there will be no type metadata found
+        and this will return quickly.
+
+        :param type_metadata_results: A list of type metadata values for a column
+        :param type_metadata_meta: A list of type metadata meta for a column
+        :return: a TypeMetadata object
+        """
+        # If there are no Type_Metadata nodes, type_metadata_results will have
+        # one object with an empty node value
+        # ToDo: Implement TypeMetadata
+        if len(type_metadata_results) > 0 or len(type_metadata_meta) > 0:
+            LOGGER.debug(f'Type Metadata: Not implemented in Nebula Graph')
+        return None
+
+    def _build_type_metadata_structure(self,
+                                       tm_dict: Dict) -> List[TypeMetadata]:
+        type_metadata = []
+        for k, v in tm_dict.items():
+            if len(v[1]) > 0:
+                v[0].children = self._build_type_metadata_structure(v[1])
+            type_metadata.append(v[0])
+
+        if len(type_metadata) > 1:
+            type_metadata.sort(key=lambda x: x.sort_order)
+
+        return type_metadata
 
     @timer_with_counter
     def _exec_usage_query(self, table_uri: str) -> List[Reader]:
@@ -363,7 +427,7 @@ class NebulaProxy(BaseProxy):
 
         # Return Value: (Watermark Results, Table Writer, Last Updated Timestamp, owner records, tag records)
 
-        # note: User `Timestamp`.`timestamp` instead of the DEPRECATED last_updated_timestamp
+        # note: Use `Timestamp`.`timestamp` instead of the DEPRECATED last_updated_timestamp
 
         table_level_query = Template(
             textwrap.dedent("""
@@ -634,8 +698,8 @@ class NebulaProxy(BaseProxy):
         """
         result_dict = json.loads(raw_data)
         return result_dict.get('results',
-                           []), result_dict.get('errors',
-                                                [{}])[0].get('code', -1)
+                               []), result_dict.get('errors',
+                                                    [{}])[0].get('code', -1)
 
     @timer_with_counter
     def _execute_query(self, query: str, param_dict: Dict[str, Any]) -> List:
@@ -650,12 +714,12 @@ class NebulaProxy(BaseProxy):
                 results, r_code = self._decode_json_result(r)
                 if r_code != 0:
                     if LOGGER.isEnabledFor(logging.DEBUG):
-                        errors = results.get('errors', '')
+                        errors = results[0].get('errors', '')
                         LOGGER.debug(
                             "Failed executing query: %s, errors: %s, results: %s",
-                            query, errors, results)
+                            query, errors, results[0])
                     raise NebulaQueryExecutionError(r_code,
-                                                    results.get('errors', ''))
+                                                    results[0].get('errors', ''))
                 return results
 
             except Exception as e:
@@ -672,8 +736,7 @@ class NebulaProxy(BaseProxy):
         """
         Generates a list of Badges objects
 
-        :param badges: A list of badges of a table or a column
-        :param badges: A list of badges' metadata of a table or a column
+        :param badges: A list of badges of a table, column, or type_metadata
         :return: a list of Badge objects
         """
         _badges = []
@@ -727,6 +790,21 @@ class NebulaProxy(BaseProxy):
                                              uri=table_uri).description
 
     @timer_with_counter
+    def get_type_metadata_description(
+            self, *, type_metadata_key: str) -> Union[str, None]:
+        """
+        Get the type_metadata description based on its key. Any exception will propagate back to api server.
+
+        :param type_metadata_key:
+        :return:
+        """
+        # ToDo: implement Type Metadata description
+        return []
+        # return self.get_resource_description(
+        #     resource_type=ResourceType.Type_Metadata,
+        #     uri=type_metadata_key).description
+
+    @timer_with_counter
     def put_resource_description(self, *, tag: ResourceType, uri: str,
                                  description: str) -> None:
         """
@@ -765,6 +843,19 @@ class NebulaProxy(BaseProxy):
         self.put_resource_description(resource_type=ResourceType.Table,
                                       uri=table_uri,
                                       description=description)
+
+    def put_type_metadata_description(self, *, type_metadata_key: str,
+                                      description: str) -> None:
+        """
+        Update type_metadata description with one from user
+        :param type_metadata_key:
+        :param description:
+        """
+        # ToDo: Implement Type Metadata description
+        pass
+        # self.put_resource_description(resource_type=ResourceType.Type_Metadata,
+        #                               uri=type_metadata_key,
+        #                               description=description)
 
     @timer_with_counter
     def get_column_description(self, *, table_uri: str,
@@ -2085,9 +2176,7 @@ class NebulaProxy(BaseProxy):
             resource_type=ResourceType.Dashboard, uri=id)
 
     @timer_with_counter
-    def put_dashboard_description(self, *,
-                                  id: str,
-                                  description: str) -> None:
+    def put_dashboard_description(self, *, id: str, description: str) -> None:
         """
         Update Dashboard description
         :param id: Dashboard URI
