@@ -33,7 +33,6 @@ def retry(backoff_sec: int = 1) -> T:
         @wraps(fn)
         def fn_retry(*args, **kwargs):
             attempts = 0
-            _backoff_sec = backoff_sec
             _retry_num = args[0]._nebula_retry_number
             while True:
                 try:
@@ -54,7 +53,6 @@ def retry(backoff_sec: int = 1) -> T:
                         )
                         time.sleep(sleep)
                         attempts += 1
-            return fn(*args, **kwargs)
 
         return fn_retry  # the decorator
 

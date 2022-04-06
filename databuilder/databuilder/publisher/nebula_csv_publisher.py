@@ -17,7 +17,7 @@ from typing import Callable, List, Set, TypeVar
 import pandas
 from jinja2 import Template
 from nebula3.common.ttypes import ErrorCode
-from nebula3.Config import Config
+from nebula3.Config import Config as NebulaConfig
 from nebula3.data.ResultSet import ResultSet
 from nebula3.gclient.net import ConnectionPool, Session
 from pyhocon import ConfigFactory, ConfigTree
@@ -122,7 +122,6 @@ def retry(backoff_sec: int = 1) -> T:
         @wraps(fn)
         def fn_retry(*args, **kwargs):
             attempts = 0
-            _backoff_sec = backoff_sec
             _retry_num = args[0]._nebula_retry_number
             while True:
                 try:
@@ -143,7 +142,6 @@ def retry(backoff_sec: int = 1) -> T:
                         )
                         time.sleep(sleep)
                         attempts += 1
-            return fn(*args, **kwargs)
 
         return fn_retry  # the decorator
 
@@ -197,7 +195,7 @@ class NebulaCsvPublisher(Publisher):
         :return: ConnectionPool
         """
         connection_pool = ConnectionPool()
-        config = Config()
+        config = NebulaConfig()
         config.max_connection_pool_size = self._nebula_max_conn_pool_size
         nebula_endpoints = [(e.split(":")[0], int(e.split(":")[1]))
                             for e in self._nebula_endpoints.split(",") if e]
@@ -241,7 +239,7 @@ class NebulaCsvPublisher(Publisher):
         )
 
         # Nebula is designed to be schemaful, read more on its documentation:
-        # https://docs.nebula-graph.io/2.6.1/2.quick-start/4.nebula-graph-crud
+        # https://docs.nebula-graph.io/3.0.2/2.quick-start/4.nebula-graph-crud
         with self._conn_pool.session_context(
                 *self._nebula_credential) as session:
             session.execute(f"USE { self._nebula_space };")
@@ -527,7 +525,7 @@ class NebulaCsvPublisher(Publisher):
             r = session.execute(query)
         except Exception as e:
             LOGGER.exception("Alter Edge Schema failed for ALTER EDGE %s,\n%s",
-                             edge_record[TAG_KEY], str(cur_propertices))
+                             edge_record[EDGE_TYPE], str(cur_propertices))
             raise e
 
         if r.is_succeeded():
@@ -547,7 +545,7 @@ class NebulaCsvPublisher(Publisher):
         except Exception as e:
             LOGGER.exception(
                 "CREATE edge type Schema failed for edge type %s",
-                vertex_record[TAG_KEY],
+                edge_record[EDGE_TYPE],
             )
             raise e
         if r.is_succeeded():

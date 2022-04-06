@@ -100,11 +100,21 @@ class NebulaProxy(BaseProxy):
         ToDo: TLS support.
         """
         LOGGER.info('Nebula endpoint: {}'.format(str(host)))
-        hosts = host.split(",")
+        self.init_connection(host, port, user, password, num_conns, query_timeout_sec, space)
+
+    def init_connection(self,
+                        host: str,
+                        port: int,
+                        user: str,
+                        password: str,
+                        num_conns: int = 100,
+                        query_timeout_sec: int = 100,
+                        space: str = "amundsen") -> None:
         self.config = NebulaConfig()
         self.config.timeout = query_timeout_sec * 1000
+        hosts = host.split(",")
         self.config.max_connection_pool_size = num_conns
-
+        self.space = space
         self._connection_pool = ConnectionPool()
         self._connection_pool.init([(h, port) for h in hosts], self.config)
         self._queue = queue.Queue()
@@ -847,7 +857,7 @@ class NebulaProxy(BaseProxy):
         :return:
         """
 
-        return self.get_resource_description(tag=ResourceType.Table,
+        return self.get_resource_description(resource_type=ResourceType.Table,
                                              uri=table_uri).description
 
     @timer_with_counter
@@ -951,7 +961,7 @@ class NebulaProxy(BaseProxy):
                                      param_dict={})[0]
         data = result.get('data', None)
         description = None
-        if data is not None:
+        if data:
             description_index = self._get_result_column_index(
                 result, "description")
             description = data[0]['row'][description_index]
@@ -1239,7 +1249,6 @@ class NebulaProxy(BaseProxy):
     def get_latest_updated_ts(self) -> Optional[int]:
         """
         API method to fetch last updated / index timestamp for Nebula, es
-        TBD: need to revisit this to see if only one record exists.
 
         :return:
         """
@@ -1252,8 +1261,11 @@ class NebulaProxy(BaseProxy):
         index_n = self._get_result_column_index(record, 'n')
         if record.get('data', None):
             # There should be one and only one record
-            return record['data'][0]['row'][index_n][
-                'Updatedtimestamp.latest_timestamp']
+            ts = record['data'][0]['row'][index_n].get("Updatedtimestamp.latest_timestamp", 0)
+            if ts is None:
+                return 0
+            else:
+                return ts
         else:
             return None
 
@@ -1383,7 +1395,7 @@ class NebulaProxy(BaseProxy):
         LOGGER.info('Querying popular tables URIs')
         num_readers = current_app.config[
             'POPULAR_RESOURCES_MINIMUM_READER_COUNT']
-        # TBD need to handle results
+
         records = self._execute_query(query=query.render(
             resource_type=resource_type.name,
             user_id=user_id,
@@ -2562,7 +2574,7 @@ class NebulaProxy(BaseProxy):
             param_dict={})[0]
         data = results.get('data', None)
 
-        if data is None:
+        if not data:
             raise NotFoundException(
                 'Feature with key {} does not exist'.format(feature_key))
 
@@ -2684,7 +2696,7 @@ class NebulaProxy(BaseProxy):
             resource_type=resource_type.name, uri=uri),
                                       param_dict={})[0]
         data = records.get('data', None)
-        if data is None:
+        if not data:
             raise NotFoundException(
                 'Generation code for id {} does not exist'.format(id))
 
