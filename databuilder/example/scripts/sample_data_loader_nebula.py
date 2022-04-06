@@ -44,6 +44,7 @@ from databuilder.publisher.elasticsearch_publisher import ElasticsearchPublisher
 from databuilder.publisher.nebula_csv_publisher import NebulaCsvPublisher
 from databuilder.task.task import DefaultTask
 from databuilder.transformer.base_transformer import ChainedTransformer, NoopTransformer
+from databuilder.transformer.complex_type_transformer import PARSING_FUNCTION, ComplexTypeTransformer
 from databuilder.transformer.dict_to_model import MODEL_CLASS, DictToModel
 from databuilder.transformer.generic_transformer import (
     CALLBACK_FUNCTION,
@@ -166,8 +167,11 @@ def run_table_column_job(table_path, column_path):
     csv_loader = FsNebulaCSVLoader()
     task = DefaultTask(extractor,
                        loader=csv_loader,
-                       transformer=NoopTransformer())
+                       transformer=ComplexTypeTransformer())
+
     job_config = ConfigFactory.from_dict({
+        f'transformer.complex_type.{PARSING_FUNCTION}':
+        'databuilder.utils.hive_complex_type_parser.parse_hive_type',
         'extractor.csvtablecolumn.table_file_location':
         table_path,
         'extractor.csvtablecolumn.column_file_location':
@@ -599,11 +603,12 @@ def create_dashboard_tables_job():
     return DefaultJob(conf=job_config, task=task, publisher=publisher)
 
 
-def create_es_publisher_sample_job(elasticsearch_index_alias='table_search_index',
-                                   elasticsearch_doc_type_key='table',
-                                   model_name='databuilder.models.table_elasticsearch_document.TableESDocument',
-                                   entity_type='table',
-                                   elasticsearch_mapping=None):
+def create_es_publisher_sample_job(
+        elasticsearch_index_alias='table_search_index',
+        elasticsearch_doc_type_key='table',
+        model_name='databuilder.models.table_elasticsearch_document.TableESDocument',
+        entity_type='table',
+        elasticsearch_mapping=None):
     """
     :param elasticsearch_index_alias:  alias for Elasticsearch used in
                                        amundsensearchlibrary/search_service/config.py as an index
@@ -628,26 +633,41 @@ def create_es_publisher_sample_job(elasticsearch_index_alias='table_search_index
     elasticsearch_new_index_key = f'{elasticsearch_doc_type_key}_{uuid.uuid4()}'
 
     job_config = ConfigFactory.from_dict({
-        'extractor.search_data.entity_type': entity_type,
-        'extractor.search_data.extractor.nebula.nebula_endpoints': nebula_endpoints,
-        'extractor.search_data.extractor.nebula.model_class': model_name,
-        'extractor.search_data.extractor.nebula.nebula_auth_user': nebula_user,
-        'extractor.search_data.extractor.nebula.nebula_auth_pw': nebula_password,
-        'extractor.search_data.extractor.nebula.nebula_space': nebula_space,
-        'loader.filesystem.elasticsearch.file_path': extracted_search_data_path,
-        'loader.filesystem.elasticsearch.mode': 'w',
-        'publisher.elasticsearch.file_path': extracted_search_data_path,
-        'publisher.elasticsearch.mode': 'r',
-        'publisher.elasticsearch.client': elasticsearch_client,
-        'publisher.elasticsearch.new_index': elasticsearch_new_index_key,
-        'publisher.elasticsearch.doc_type': elasticsearch_doc_type_key,
-        'publisher.elasticsearch.alias': elasticsearch_index_alias,
+        'extractor.search_data.entity_type':
+        entity_type,
+        'extractor.search_data.extractor.nebula.nebula_endpoints':
+        nebula_endpoints,
+        'extractor.search_data.extractor.nebula.model_class':
+        model_name,
+        'extractor.search_data.extractor.nebula.nebula_auth_user':
+        nebula_user,
+        'extractor.search_data.extractor.nebula.nebula_auth_pw':
+        nebula_password,
+        'extractor.search_data.extractor.nebula.nebula_space':
+        nebula_space,
+        'loader.filesystem.elasticsearch.file_path':
+        extracted_search_data_path,
+        'loader.filesystem.elasticsearch.mode':
+        'w',
+        'publisher.elasticsearch.file_path':
+        extracted_search_data_path,
+        'publisher.elasticsearch.mode':
+        'r',
+        'publisher.elasticsearch.client':
+        elasticsearch_client,
+        'publisher.elasticsearch.new_index':
+        elasticsearch_new_index_key,
+        'publisher.elasticsearch.doc_type':
+        elasticsearch_doc_type_key,
+        'publisher.elasticsearch.alias':
+        elasticsearch_index_alias,
     })
 
     # only optionally add these keys, so need to dynamically `put` them
     if elasticsearch_mapping:
-        job_config.put(f'publisher.elasticsearch.{ElasticsearchPublisher.ELASTICSEARCH_MAPPING_CONFIG_KEY}',
-                       elasticsearch_mapping)
+        job_config.put(
+            f'publisher.elasticsearch.{ElasticsearchPublisher.ELASTICSEARCH_MAPPING_CONFIG_KEY}',
+            elasticsearch_mapping)
 
     job = DefaultJob(conf=job_config,
                      task=task,
@@ -769,13 +789,15 @@ if __name__ == "__main__":
         elasticsearch_index_alias='table_search_index',
         elasticsearch_doc_type_key='table',
         entity_type='table',
-        model_name='databuilder.models.table_elasticsearch_document.TableESDocument')
+        model_name=
+        'databuilder.models.table_elasticsearch_document.TableESDocument')
     job_es_table.launch()
 
     job_es_user = create_es_publisher_sample_job(
         elasticsearch_index_alias='user_search_index',
         elasticsearch_doc_type_key='user',
-        model_name='databuilder.models.user_elasticsearch_document.UserESDocument',
+        model_name=
+        'databuilder.models.user_elasticsearch_document.UserESDocument',
         entity_type='user',
         elasticsearch_mapping=USER_INDEX_MAP)
     job_es_user.launch()
@@ -783,7 +805,8 @@ if __name__ == "__main__":
     job_es_dashboard = create_es_publisher_sample_job(
         elasticsearch_index_alias='dashboard_search_index',
         elasticsearch_doc_type_key='dashboard',
-        model_name='databuilder.models.dashboard_elasticsearch_document.DashboardESDocument',
+        model_name=
+        'databuilder.models.dashboard_elasticsearch_document.DashboardESDocument',
         entity_type='dashboard',
         elasticsearch_mapping=DASHBOARD_ELASTICSEARCH_INDEX_MAPPING)
     job_es_dashboard.launch()
