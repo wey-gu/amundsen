@@ -20,6 +20,7 @@ from databuilder.models.graph_serializable import (
     RELATION_TYPE,
 )
 from databuilder.models.user import User as UserMetadata
+from databuilder.models.type_metadata import TypeMetadata
 
 # Mandatory fields for Nebula Vertex
 NEBULA_VERTEX_MANDATORY_FIELDS = {
@@ -36,6 +37,12 @@ NEBULA_VERTEX_MANDATORY_FIELDS = {
             "type": str,
             "Default": ""
         },
+    },
+    TypeMetadata.NODE_LABEL: {
+        "sort_order": {
+            "type": int,
+            "Default": 0
+        }
     }
 }
 

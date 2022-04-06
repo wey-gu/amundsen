@@ -273,7 +273,8 @@ class NebulaProxy(BaseProxy):
     @timer_with_counter
     def _exec_col_query(self, table_uri: str) -> Tuple:
         # Return Value: (Columns, Last Row of Query)
-
+        # Note: collect(distinct tm_badge) AS tm_badges was handled in yet another
+        # layer of WITH in Nebula Graph
         column_level_query = Template(
             textwrap.dedent("""
         MATCH (db:Database)-[:CLUSTER]->(clstr:Cluster)-[:SCHEMA]->(schema:Schema)
@@ -283,42 +284,24 @@ class NebulaProxy(BaseProxy):
         OPTIONAL MATCH (col:Column)-[:DESCRIPTION]->(col_dscrpt:Description)
         OPTIONAL MATCH (col:Column)-[:STAT]->(stat:Stat)
         OPTIONAL MATCH (col:Column)-[:HAS_BADGE]->(badge:Badge)
-        RETURN db, clstr, schema, tbl, tbl_dscrpt, col, col_dscrpt, collect(distinct stat) AS col_stats,
-        collect(distinct badge) AS col_badges, col.Column.sort_order AS sort_order
-        ORDER BY sort_order;"""))
-        # ToDo: support
-        # column_level_query = Template(
-        #     textwrap.dedent("""
-        # MATCH (db:Database)-[:CLUSTER]->(clstr:Cluster)-[:SCHEMA]->(schema:Schema)
-        # -[:TABLE]->(tbl:Table)-[:COLUMN]->(col:Column)
-        # WHERE id(tbl) == "{{ vid }}"
-        # OPTIONAL MATCH (tbl)-[:DESCRIPTION]->(tbl_dscrpt:Description)
-        # OPTIONAL MATCH (col:Column)-[:DESCRIPTION]->(col_dscrpt:Description)
-        # OPTIONAL MATCH (col:Column)-[:STAT]->(stat:Stat)
-        # OPTIONAL MATCH (col:Column)-[:HAS_BADGE]->(badge:Badge)
-        # OPTIONAL MATCH (col:Column)-[:TYPE_METADATA]->(Type_Metadata)-[:SUBTYPE *0..]->(tm:Type_Metadata)
-        # OPTIONAL MATCH (tm:Type_Metadata)-[:DESCRIPTION]->(tm_dscrpt:Description)
-        # OPTIONAL MATCH (tm:Type_Metadata)-[:HAS_BADGE]->(tm_badge:Badge)
-        # WITH db, clstr, schema, tbl, tbl_dscrpt, col, col_dscrpt, collect(distinct stat) AS col_stats,
-        # collect(distinct badge) AS col_badges, col.Column.sort_order AS sort_order,
-        # {node: tm, description: tm_dscrpt, badges: collect(distinct tm_badge)} AS tm_results
-        # RETURN db, clstr, schema, tbl, tbl_dscrpt, col, col_dscrpt, col_stats, col_badges,
-        # collect(distinct tm_results) AS col_type_metadata
-        # ORDER BY sort_order;"""))
+        OPTIONAL MATCH (col:Column)-[:TYPE_METADATA]->(Type_Metadata)-[:SUBTYPE *0..]->(tm:Type_Metadata)
+        OPTIONAL MATCH (tm:Type_Metadata)-[:DESCRIPTION]->(tm_dscrpt:Description)
+        OPTIONAL MATCH (tm:Type_Metadata)-[:HAS_BADGE]->(tm_badge:Badge)
+        WITH db, clstr, schema, tbl, tbl_dscrpt, col, col_dscrpt, collect(distinct stat) AS col_stats,
+        collect(distinct badge) AS col_badges, col.Column.sort_order AS sort_order,
+        {node: tm, description: tm_dscrpt} AS tm_results, collect(distinct tm_badge) AS tm_badges
+        RETURN db, clstr, schema, tbl, tbl_dscrpt, col, col_dscrpt, col_stats, col_badges,
+        collect(distinct {node: tm_results['node'], description: tm_results['description'], badge: tm_badges}) AS col_type_metadata,
+        sort_order ORDER BY sort_order;"""))
 
         tbl_col_nebula_records = self._execute_query(
             query=column_level_query.render(vid=table_uri), param_dict={})[0]
         cols = []
 
-        # (i_col_stats, i_col_badges, i_col, i_col_dscrpt,
-        #  i_col_type_metadata) = self._get_result_column_indexes(
-        #      tbl_col_nebula_records, ('col_stats', 'col_badges', 'col',
-        #                               'col_dscrpt', 'col_type_metadata'))
-
-        (i_col_stats, i_col_badges, i_col,
-         i_col_dscrpt) = self._get_result_column_indexes(
-             tbl_col_nebula_records,
-             ('col_stats', 'col_badges', 'col', 'col_dscrpt'))
+        (i_col_stats, i_col_badges, i_col, i_col_dscrpt,
+         i_col_type_metadata) = self._get_result_column_indexes(
+             tbl_col_nebula_records, ('col_stats', 'col_badges', 'col',
+                                      'col_dscrpt', 'col_type_metadata'))
 
         for record in tbl_col_nebula_records.get('data', []):
             col_stats = []
@@ -333,10 +316,9 @@ class NebulaProxy(BaseProxy):
             column_badges = self._make_badges(record['row'][i_col_badges],
                                               record['meta'][i_col_badges])
 
-            col_type_metadata = []
-            # col_type_metadata = self._get_type_metadata(
-            #     record['row'][i_col_type_metadata],
-            #     record['meta'][i_col_type_metadata])
+            col_type_metadata = self._get_type_metadata(
+                record['row'][i_col_type_metadata],
+                record['meta'][i_col_type_metadata])
 
             col = Column(name=record['row'][i_col]['Column.name'],
                          description=record['row'][i_col_dscrpt].get(
@@ -371,18 +353,97 @@ class NebulaProxy(BaseProxy):
         """
         # If there are no Type_Metadata nodes, type_metadata_results will have
         # one object with an empty node value
-        # ToDo: Implement TypeMetadata
-        if len(type_metadata_results) > 0 or len(type_metadata_meta) > 0:
-            LOGGER.debug(f'Type Metadata: Not implemented in Nebula Graph')
-        return None
 
-    def _build_type_metadata_structure(self,
-                                       tm_dict: Dict) -> List[TypeMetadata]:
+        if len(type_metadata_results
+               ) > 0 and type_metadata_results[0]['node'] is not None:
+            i_badge_meta, i_desc_meta, i_node_meta = 0, 1, 2
+            for i, result in enumerate(type_metadata_results):
+                result_meta = type_metadata_meta[i]
+                for j, badge in enumerate(
+                        result['badge']) if result['badge'] else []:
+                    self._format_record(badge, "Badge")
+                    badge['key'] = result_meta[i_badge_meta][j].get('id', None)
+
+                if result['description']:
+                    self._format_record(result['description'], "Description")
+                    result['description']['key'] = result_meta[
+                        i_desc_meta].get('id', None)
+
+                if result['node']:
+                    self._format_record(result['node'],
+                                        ResourceType.Type_Metadata.name)
+                    result['node']['key'] = result_meta[i_node_meta].get(
+                        'id', None)
+            sorted_type_metadata = sorted(type_metadata_results,
+                                          key=lambda x: x['node']['key'])
+        else:
+            return None
+
+        type_metadata_nodes: Dict[str, TypeMetadata] = {}
+        type_metadata_children: Dict[str, Dict] = {}
+        for tm in sorted_type_metadata:
+            tm_node = tm['node']
+            description = self._safe_get(tm, 'description', 'description')
+            sort_order = self._safe_get(tm_node, 'sort_order') or 0
+            badges = self._safe_get(tm, 'badges')
+            # kind refers to the general type of the TypeMetadata, such as "array" or "map",
+            # while data_type refers to the entire type such as "array<int>" or "map<string, string>"
+            type_metadata = TypeMetadata(
+                kind=tm_node['kind'],
+                name=tm_node['name'],
+                key=tm_node['key'],
+                description=description,
+                data_type=tm_node['data_type'],
+                sort_order=sort_order,
+                badges=self._make_badges(badges) if badges else [])
+
+            # type_metadata_nodes maps each type metadata path to its corresponding TypeMetadata object
+            tm_key_regex = re.compile(
+                r'(?P<db>\w+):\/\/(?P<cluster>\w+)\.(?P<schema>\w+)\/(?P<tbl>\w+)\/(?P<col>\w+)\/type\/(?P<tm_path>.*)'
+            )
+            tm_key_match = tm_key_regex.search(type_metadata.key)
+            if tm_key_match is None:
+                LOGGER.error(
+                    f'Could not retrieve the type metadata path from key {type_metadata.key}'
+                )
+                continue
+            tm_path = tm_key_match.group('tm_path')
+            type_metadata_nodes[tm_path] = type_metadata
+
+            # type_metadata_children is a nested dict where each type metadata node name
+            # maps to a dict of its children's names
+            split_key_list = tm_path.split('/')
+            tm_name = split_key_list.pop()
+            node_children = self._safe_get(type_metadata_children,
+                                           *split_key_list)
+            if node_children is not None:
+                node_children[tm_name] = {}
+            else:
+                LOGGER.error(
+                    f'Could not construct the dict of children for type metadata key {type_metadata.key}'
+                )
+
+        # Iterate over the temporary children dict to create the proper TypeMetadata structure
+        result = self._build_type_metadata_structure('',
+                                                     type_metadata_children,
+                                                     type_metadata_nodes)
+        return result[0] if len(result) > 0 else None
+
+    def _build_type_metadata_structure(self, prev_path: str, tm_children: Dict,
+                                       tm_nodes: Dict) -> List[TypeMetadata]:
         type_metadata = []
-        for k, v in tm_dict.items():
-            if len(v[1]) > 0:
-                v[0].children = self._build_type_metadata_structure(v[1])
-            type_metadata.append(v[0])
+        for node_name, children in tm_children.items():
+            curr_path = f'{prev_path}/{node_name}' if prev_path else node_name
+            tm = tm_nodes.get(curr_path)
+            if tm is None:
+                LOGGER.error(
+                    f'Could not find expected type metadata object at type metadata path {curr_path}'
+                )
+                continue
+            if len(children) > 0:
+                tm.children = self._build_type_metadata_structure(
+                    curr_path, children, tm_nodes)
+            type_metadata.append(tm)
 
         if len(type_metadata) > 1:
             type_metadata.sort(key=lambda x: x.sort_order)
@@ -718,8 +779,8 @@ class NebulaProxy(BaseProxy):
                         LOGGER.debug(
                             "Failed executing query: %s, errors: %s, results: %s",
                             query, errors, results[0])
-                    raise NebulaQueryExecutionError(r_code,
-                                                    results[0].get('errors', ''))
+                    raise NebulaQueryExecutionError(
+                        r_code, results[0].get('errors', ''))
                 return results
 
             except Exception as e:
@@ -769,9 +830,9 @@ class NebulaProxy(BaseProxy):
                                            vid=uri),
             param_dict={},
         )[0]
-        data = result.get('data', None)
+        data = result.get('data', [])
         description = None
-        if data is not None:
+        if len(data) > 0 and data[0].get('row', None) is not None:
             description_index = self._get_result_column_index(
                 result, "description")
             description = data[0]['row'][description_index]
@@ -798,37 +859,48 @@ class NebulaProxy(BaseProxy):
         :param type_metadata_key:
         :return:
         """
-        # ToDo: implement Type Metadata description
-        return []
-        # return self.get_resource_description(
-        #     resource_type=ResourceType.Type_Metadata,
-        #     uri=type_metadata_key).description
+
+        return self.get_resource_description(
+            resource_type=ResourceType.Type_Metadata,
+            uri=type_metadata_key).description
 
     @timer_with_counter
-    def put_resource_description(self, *, tag: ResourceType, uri: str,
-                                 description: str) -> None:
+    def put_resource_description(self, *, resource_type: ResourceType,
+                                 uri: str, description: str) -> None:
         """
         Update resource description with one from user
-        # TBD, to see if the edges should be added
         :param uri: Resource uri (Vertex ID in Nebula Graph)
         :param description: new value for resource description
         """
         desc_vid = uri + '/_description'
-        # ut
-        # uri = 'hive://gold.test_schema/test_table1'
-        # description = '1st test table'
 
         description = re.escape(description)
         upsert_desc_query = Template(
             textwrap.dedent("""
-        UPDATE VERTEX ON `Description` "{{ desc_vid }}"
-        SET `description` = "{{ description }}"
-        WHEN description != "{{ description }}"
+        UPSERT EDGE ON DESCRIPTION_OF
+        "{{ desc_vid }}" -> "{{ uri }}"
+        SET START_LABEL = "Description",
+            END_LABEL = "{{ resource_type }}"
+        WHEN START_LABEL != "Description";
+
+        UPSERT EDGE ON DESCRIPTION
+        "{{ uri }}" -> "{{ desc_vid }}"
+        SET END_LABEL = "Description",
+            START_LABEL = "{{ resource_type }}"
+        WHEN END_LABEL != "Description";
+
+        UPSERT VERTEX ON `Description` "{{ desc_vid }}"
+        SET `description` = '{{ description }}'
+        WHEN description != '{{ description }}'
         YIELD description;
         """))
 
         self._execute_query(query=upsert_desc_query.render(
-            description=description, desc_vid=desc_vid),
+            description=description,
+            uri=uri,
+            desc_vid=desc_vid,
+            resource_type=resource_type.name,
+        ),
                             param_dict={})
 
     @timer_with_counter
@@ -851,11 +923,9 @@ class NebulaProxy(BaseProxy):
         :param type_metadata_key:
         :param description:
         """
-        # ToDo: Implement Type Metadata description
-        pass
-        # self.put_resource_description(resource_type=ResourceType.Type_Metadata,
-        #                               uri=type_metadata_key,
-        #                               description=description)
+        self.put_resource_description(resource_type=ResourceType.Type_Metadata,
+                                      uri=type_metadata_key,
+                                      description=description)
 
     @timer_with_counter
     def get_column_description(self, *, table_uri: str,
@@ -867,9 +937,7 @@ class NebulaProxy(BaseProxy):
         :param column_name:
         :return:
         """
-        # ut:
-        # column_name = "col1"
-        # table_uri = "hive://gold.test_schema/test_table1"
+
         column_vid = f"{ table_uri }/{ column_name }"
         column_description_query = Template(
             textwrap.dedent("""
@@ -937,11 +1005,6 @@ class NebulaProxy(BaseProxy):
         user_email = owner
         create_owner_query = Template(
             textwrap.dedent("""
-            UPSERT VERTEX ON `User` "{{ user_email }}"
-            SET email = "{{ user_email }}"
-            WHEN email != "{{ user_email }}"
-            YIELD email;
-
             UPSERT EDGE ON OWNER_OF
             "{{ user_email }}" -> "{{ uri }}"
             SET START_LABEL = "User",
@@ -953,6 +1016,11 @@ class NebulaProxy(BaseProxy):
             SET END_LABEL = "User",
                 START_LABEL = "{{ resource_type }}"
             WHEN END_LABEL != "User";
+
+            UPSERT VERTEX ON `User` "{{ user_email }}"
+            SET email = "{{ user_email }}"
+            WHEN email != "{{ user_email }}"
+            YIELD email;
         """))
 
         self._execute_query(query=create_owner_query.render(
@@ -1003,11 +1071,6 @@ class NebulaProxy(BaseProxy):
 
         add_badge_query = Template(
             textwrap.dedent("""
-            UPSERT VERTEX ON `Badge` "{{ badge_name }}"
-            SET category = "{{ category }}"
-            WHEN category != "{{ category }}"
-            YIELD category;
-
             UPSERT EDGE ON BADGE_FOR
             "{{ badge_name }}" -> "{{ uri }}"
             SET START_LABEL = "Badge",
@@ -1019,6 +1082,11 @@ class NebulaProxy(BaseProxy):
             SET END_LABEL = "Badge",
                 START_LABEL = "{{ resource_type }}"
             WHEN END_LABEL != "Badge";
+
+            UPSERT VERTEX ON `Badge` "{{ badge_name }}"
+            SET category = "{{ category }}"
+            WHEN category != "{{ category }}"
+            YIELD category;
         """))
 
         self._execute_query(query=add_badge_query.render(
@@ -1027,12 +1095,6 @@ class NebulaProxy(BaseProxy):
             category=category,
             resource_type=resource_type.name),
                             param_dict={})
-
-        # ut: badge_name = "test_badge"
-        # ut: category = "column"
-        # ut: resource_type = "Column"
-        # ut: id = "dynamo://gold.test_schema/test_table2/col1"
-        # ut: go from "test_badge" over * bidirect yield id($^) as src, id($$) as dst, type(edge), properties(edge)
 
     @timer_with_counter
     def delete_badge(self, id: str, badge_name: str, category: str,
@@ -1090,11 +1152,6 @@ class NebulaProxy(BaseProxy):
 
         add_tag_query = Template(
             textwrap.dedent("""
-            UPSERT VERTEX ON `Tag` "{{ tag }}"
-            SET tag_type = "{{ tag_type }}"
-            WHEN tag_type != "{{ tag_type }}"
-            YIELD tag_type;
-
             UPSERT EDGE ON `TAG`
             "{{ tag }}" -> "{{ uri }}"
             SET START_LABEL = "Badge",
@@ -1106,12 +1163,12 @@ class NebulaProxy(BaseProxy):
             SET END_LABEL = "Badge",
                 START_LABEL = "{{ resource_type }}"
             WHEN END_LABEL != "Badge";
+
+            UPSERT VERTEX ON `Tag` "{{ tag }}"
+            SET tag_type = "{{ tag_type }}"
+            WHEN tag_type != "{{ tag_type }}"
+            YIELD tag_type;
         """))
-        # ut:
-        # tag = "test_tag"
-        # tag_type, resource_type = "default", "Table"
-        # id = "dynamo://gold.test_schema/test_table2"
-        # ut: go from "test_tag" over * bidirect yield id($^) as src, id($$) as dst, type(edge), properties(edge)
 
         self._execute_query(query=add_tag_query.render(
             uri=id,
@@ -1285,11 +1342,6 @@ class NebulaProxy(BaseProxy):
         num_readers = current_app.config[
             'POPULAR_RESOURCES_MINIMUM_READER_COUNT']
 
-        # UT:
-        # resource_type = 'Table'
-        # num_readers = 4
-        # num_entries = 10
-
         records = self._execute_query(query=query.render(
             resource_type=resource_type.name,
             num_readers=num_readers,
@@ -1367,7 +1419,6 @@ class NebulaProxy(BaseProxy):
             return []
 
         # note(Wey) We render table_uris into list in string for now, will change to do from param_dict later
-        # ut: table_uris=['hive://gold.test_schema/test_table1', 'dynamo://gold.test_schema/test_table2']
 
         query = Template(
             textwrap.dedent("""
@@ -1406,7 +1457,6 @@ class NebulaProxy(BaseProxy):
         if not resource_uris:
             return []
         # note(Wey) We render resource_uris into list in string for now, will change to do from param_dict later
-        # ut: resource_uris=["hive://gold.test_schema/test_table1","hive://gold.test_schema/test's_table4"]
 
         query = Template(
             textwrap.dedent("""
@@ -1445,7 +1495,6 @@ class NebulaProxy(BaseProxy):
         if not resource_uris:
             return []
         # note(Wey) We render resource_uris into list in string for now, will change to do from param_dict later
-        # ut: resource_uris=["mode_dashboard://gold.test_group_id_1/test_dashboard_id_1","superset_dashboard://gold.test_group_id_3/test_dashboard_id_3"]
         query = Template(
             textwrap.dedent("""
         MATCH (d:Dashboard)-[:DASHBOARD_OF]->(dg:Dashboardgroup)-[:DASHBOARD_GROUP_OF]->(c:Cluster)
@@ -1535,7 +1584,6 @@ class NebulaProxy(BaseProxy):
         OPTIONAL MATCH (u:`User`)-[:MANAGE_BY]->(manager:`User`)
         RETURN u AS user_record, manager AS manager_record
         """))
-        # ut: id = roald.amundsen@example.org
 
         record = self._execute_query(query=query.render(vid=id),
                                      param_dict={})[0]
@@ -1777,9 +1825,6 @@ class NebulaProxy(BaseProxy):
         dscrpt.Description.description AS description, last_exec.Execution.`timestamp` AS last_successful_run_timestamp"""
                             ))
 
-        # TBD handle the result
-        # UT: user_email = "roald.amundsen@example.org"
-        # UT: relation_type = UserResourceRel.own
         records = self._execute_query(query=query.render(
             rel_clause=rel_clause, where_clause=where_clause),
                                       param_dict={})[0]
@@ -1934,16 +1979,6 @@ class NebulaProxy(BaseProxy):
 
         query = Template(
             textwrap.dedent("""
-        UPSERT VERTEX ON `User` "{{ user_email }}"
-        SET email = "{{ user_email }}"
-        WHEN email != "{{ user_email }}"
-        YIELD email;
-
-        UPSERT VERTEX ON `{{ resource_type }}` "{{ resource_id }}"
-        SET name = "{{ user_email }}"
-        WHEN name != "{{ user_email }}"
-        YIELD name;
-
         UPSERT EDGE ON `{{ edge_type }}`
         "{{ user_email }}" -> "{{ resource_id }}"
         SET START_LABEL = "User",
@@ -1957,11 +1992,17 @@ class NebulaProxy(BaseProxy):
             START_LABEL = "{{ resource_type }}"
         WHEN END_LABEL != "User" OR START_LABEL != "{{ resource_type }}"
         YIELD START_LABEL, START_LABEL;
+
+        UPSERT VERTEX ON `User` "{{ user_email }}"
+        SET email = "{{ user_email }}"
+        WHEN email != "{{ user_email }}"
+        YIELD email;
+
+        UPSERT VERTEX ON `{{ resource_type }}` "{{ resource_id }}"
+        SET name = "{{ user_email }}"
+        WHEN name != "{{ user_email }}"
+        YIELD name;
         """))
-        # UT: relation_type = UserResourceRel.read
-        # UT: resource_type = ResourceType.Table
-        # UT: user_id = 'chrisc@example.org'
-        # UT: MATCH p=()-[:READ_BY]-(n:`User`)-[:READ]-() WHERE id(n) == "chrisc@example.org" RETURN p;
 
         result = self._execute_query(query=query.render(
             user_email=user_id,
@@ -1996,14 +2037,6 @@ class NebulaProxy(BaseProxy):
             DELETE EDGE `{{ edge_type }}` "{{ user_id }}" -> "{{ id }}";
             DELETE EDGE `{{ reverse_edge_type }}` "{{ id }}" -> "{{ user_id }}";
             """))
-        # UT
-        # relation_type = UserResourceRel.read
-        # id = "hive://gold.test_schema/test_table1"
-        # user_id = "chrisc@example.org"
-        # MATCH p=()-[:READ_BY]-(n:`User`)-[:READ]-(m)
-        # WHERE id(n) == "chrisc@example.org" AND
-        # id(m) == "hive://gold.test_schema/test_table1" RETURN p;
-        # empty result
 
         self._execute_query(query=delete_query.render(
             edge_type=edge_type,
@@ -2017,7 +2050,6 @@ class NebulaProxy(BaseProxy):
         self,
         id: str,
     ) -> DashboardDetailEntity:
-        # UT: id = "mode_dashboard://gold.test_group_id_2/test_dashboard_id_2"
         get_dashboard_detail_query = Template(
             textwrap.dedent("""
         MATCH (d:Dashboard)-[:DASHBOARD_OF]->(dg:Dashboardgroup)-[:DASHBOARD_GROUP_OF]->(c:Cluster)
@@ -2072,9 +2104,6 @@ class NebulaProxy(BaseProxy):
         tables;
         """))
 
-        # ut:
-        # id = "mode_dashboard://gold.test_group_id_2/test_dashboard_id_2"
-        # TBD to handle result
         dashboard_record = self._execute_query(
             query=get_dashboard_detail_query.render(id=id),
             param_dict={"tag_normal_type": NebulaValue(sVal="default")})[0]
@@ -2201,8 +2230,6 @@ class NebulaProxy(BaseProxy):
             raise NotImplementedError(
                 '{} is not supported'.format(resource_type))
 
-        # ut
-        # id = 'hive://gold.test_schema/test_table1'
         get_dashboards_using_table_query = Template(
             textwrap.dedent("""
         MATCH (d:Dashboard)-[:DASHBOARD_WITH_TABLE]->(table:Table),
@@ -2280,10 +2307,6 @@ class NebulaProxy(BaseProxy):
         :param depth: depth or level of lineage information
         :return: The Lineage object with upstream & downstream lineage items
         """
-        # ut:
-        # resource_type = resource_type.Table
-        # id = "dynamo://gold.test_schema/test_table2"
-        # depth = 4
 
         get_both_lineage_query = Template(
             textwrap.dedent("""
@@ -2374,31 +2397,33 @@ class NebulaProxy(BaseProxy):
             i_downstream_entities = self._get_result_column_index(
                 records, "downstream_entities")
             for downstream in data_record[0]['row'][i_downstream_entities]:
-                downstream_tables.append(
-                    LineageItem(
-                        **{
-                            "key": downstream["key"],
-                            "source": downstream["source"],
-                            "level": downstream["level"],
-                            "badges": downstream.get("badges", None),
-                            "usage": downstream.get("usage", 0),
-                            "parent": downstream.get("parent", '')
-                        }))
+                if downstream.get('key') is not None:
+                    downstream_tables.append(
+                        LineageItem(
+                            **{
+                                "key": downstream["key"],
+                                "source": downstream["source"],
+                                "level": downstream["level"],
+                                "badges": downstream.get("badges", None),
+                                "usage": downstream.get("usage", 0),
+                                "parent": downstream.get("parent", '')
+                            }))
 
         if data_record and "upstream_entities" in records['columns']:
             i_upstream_entities = self._get_result_column_index(
                 records, "upstream_entities")
             for upstream in data_record[0]['row'][i_upstream_entities]:
-                upstream_tables.append(
-                    LineageItem(
-                        **{
-                            "key": upstream["key"],
-                            "source": upstream["source"],
-                            "level": upstream["level"],
-                            "badges": upstream.get("badges", None),
-                            "usage": upstream.get("usage", 0),
-                            "parent": upstream.get("parent", '')
-                        }))
+                if upstream.get('key') is not None:
+                    upstream_tables.append(
+                        LineageItem(
+                            **{
+                                "key": upstream["key"],
+                                "source": upstream["source"],
+                                "level": upstream["level"],
+                                "badges": upstream.get("badges", None),
+                                "usage": upstream.get("usage", 0),
+                                "parent": upstream.get("parent", '')
+                            }))
 
         # ToDo: Add a root_entity AS an item, which will make it easier for lineage graph
         return Lineage(
@@ -2647,9 +2672,7 @@ class NebulaProxy(BaseProxy):
         """
         Executes cypher query to get query nodes associated with resource
         """
-        # ut:
-        # resource_type = ResourceType.Feature
-        # uri = "feature_group_1/feature meta 1/v0alpha1"
+
         query = Template(
             textwrap.dedent("""
         MATCH (feat:`{{ resource_type }}`)
