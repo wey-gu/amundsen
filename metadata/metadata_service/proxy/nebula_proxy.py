@@ -8,6 +8,8 @@ import re
 import textwrap
 import time
 
+from threading import Lock
+
 from contextlib import contextmanager
 from random import randint
 from typing import (
@@ -41,7 +43,8 @@ from jinja2 import Template
 from nebula3.common.ttypes import Value as NebulaValue
 from nebula3.Config import Config as NebulaConfig
 from nebula3.gclient.net import ConnectionPool, Session
-
+from nebula3.fbthrift.transport.TTransport import TTransportException
+from nebula3.Exception import IOErrorException
 from metadata_service import config
 from metadata_service.entity.dashboard_detail import \
     DashboardDetail as DashboardDetailEntity
@@ -64,6 +67,8 @@ LAST_UPDATED_EPOCH_MS = 'publisher_last_updated_epoch_ms'
 PUBLISHED_PROPERTY_NAME = 'published_tag'
 
 LOGGER = logging.getLogger(__name__)
+
+_NEBULA_CONNECTION_INIT_LOCK = Lock()
 
 
 class NebulaQueryExecutionError(Exception):
@@ -100,44 +105,105 @@ class NebulaProxy(BaseProxy):
         ToDo: TLS support.
         """
         LOGGER.info('Nebula endpoint: {}'.format(str(host)))
-        self.init_connection(host, port, user, password, num_conns, query_timeout_sec, space)
-
-    def init_connection(self,
-                        host: str,
-                        port: int,
-                        user: str,
-                        password: str,
-                        num_conns: int = 100,
-                        query_timeout_sec: int = 100,
-                        space: str = "amundsen") -> None:
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
         self.config = NebulaConfig()
-        self.config.timeout = query_timeout_sec * 1000
-        hosts = host.split(",")
         self.config.max_connection_pool_size = num_conns
+        self.config.timeout = query_timeout_sec * 1000
         self.space = space
-        self._connection_pool = ConnectionPool()
-        self._connection_pool.init([(h, port) for h in hosts], self.config)
-        self._queue = queue.Queue()
-        for c in range(num_conns):
-            session = self._connection_pool.get_session(user, password)
-            result = session.execute_json(f"USE { space }")
-            _, r_code = self._decode_json_result(result)
-            if r_code != 0:
-                LOGGER.exception(
-                    f"Failed to Failed to switch to Nebula Graph Space: { space }"
-                    f", hosts: { hosts }, please ensure the Nebula Graph was"
-                    f"bootstraped with Dataloader. Result: { _ }")
-                raise NebulaQueryExecutionError(
-                    f"Failed to switch graph space {space}")
-            self._queue.put(session)
+        self._queue = None
+        self._connection_pool = None
+        self.init_connection()
+
+    def init_connection(self) -> None:
+        hosts = self.host.split(",")
+        with self.get_conn_init_lock(timeout_sec=3):
+            if self._queue:
+                for s in self._queue.queue:
+                    s.release()
+            self._queue = queue.Queue()
+            if self._connection_pool is not None:
+                LOGGER.info("Connection pool already exists, closing it.")
+                self._connection_pool.close()
+            self._connection_pool = ConnectionPool()
+            self._connection_pool.init([(h, self.port) for h in hosts],
+                                       self.config)
+
+            for c in range(self.config.max_connection_pool_size):
+                session = self._connection_pool.get_session(
+                    self.user, self.password)
+                result = session.execute_json(f"USE { self.space }")
+                _, r_code = self._decode_json_result(result)
+                if r_code != 0:
+                    LOGGER.exception(
+                        f"Failed to Failed to switch to Space: { self.space }"
+                        f", hosts: { hosts }, please ensure the Nebula Graph was"
+                        f"bootstraped with Dataloader. Result: { _ }")
+                    raise NebulaQueryExecutionError(
+                        f"Failed to switch graph space {self.space}")
+                self._queue.put(session)
+
+    @contextmanager
+    def get_conn_init_lock(self, timeout_sec):
+        lock = False
+        try:
+            lock = _NEBULA_CONNECTION_INIT_LOCK.acquire(timeout=timeout_sec)
+            yield lock
+            if lock:
+                _NEBULA_CONNECTION_INIT_LOCK.release
+        except Exception as e:
+            LOGGER.exception(
+                f"Something went wrong during the connection init: {e}")
+        finally:
+            if lock and _NEBULA_CONNECTION_INIT_LOCK.locked():
+                LOGGER.debug("Finally force releasing lock.")
+                try:
+                    _NEBULA_CONNECTION_INIT_LOCK.release()
+                except RuntimeError:
+                    pass
+                except Exception as e:
+                    LOGGER.exception(f"Force release lock failed: {e},")
 
     @contextmanager
     def get_session(self) -> Session:
-        session = self._queue.get()
+        try:
+            session = self._queue.get(timeout=1)
+        except queue.Empty:
+            if self._queue.qsize() < self.config.max_connection_pool_size:
+                try:
+                    session = self._connection_pool.get_session()
+                    session.execute_json(f"USE { self.space }")
+                except Exception as e:
+                    LOGGER.debug(f"Failed to get session: {e}")
+                    raise NebulaQueryExecutionError(
+                        f"Failed to get session: {e}")
+            else:
+                raise NebulaQueryExecutionError(
+                    f"maximum connection pool size reached")
         try:
             yield session
+
+        except (TTransportException, IOErrorException, RuntimeError) as e:
+            # idle session will be released from server side
+            # see: https://docs.nebula-graph.io/3.0.2/5.configurations-and-logs/1.configurations/3.graph-config/
+            # client_idle_timeout_secs and session_idle_timeout_secs to be configured in graphd.conf
+            LOGGER.debug(f"Connection to Nebula Graph is lost. It could be "
+                         f"due to idle for too long, or network issue: {e}."
+                         f"Trying to reconnect...")
+            self.init_connection()
+            raise e
+
         finally:
-            self._queue.put(session)
+            try:
+                if session:
+                    self._queue.put(session)
+            except NameError:
+                LOGGER.info(
+                    "session was deleted, will not be put back to queue")
+            except Exception as e:
+                LOGGER.exception(f"Failed to put session back to queue: {e}")
 
     def health(self) -> health_check.HealthCheck:
         """
@@ -492,7 +558,7 @@ class NebulaProxy(BaseProxy):
     @timer_with_counter
     def _exec_table_query(self, table_uri: str) -> Tuple:
         """
-        Queries one Cypher record with watermark list, Application,
+        Queries one record with watermark list, Application,
         ,timestamp, owner records and tag records.
         """
 
@@ -617,7 +683,7 @@ class NebulaProxy(BaseProxy):
     @timer_with_counter
     def _exec_table_query_query(self, table_uri: str) -> Tuple:
         """
-        Queries one Cypher record with results that contain information about queries
+        Queries one record with results that contain information about queries
         and entities (e.g. joins, where clauses, etc.) associated to queries that are executed
         on the table.
         """
@@ -792,6 +858,14 @@ class NebulaProxy(BaseProxy):
                     raise NebulaQueryExecutionError(
                         r_code, results[0].get('errors', ''))
                 return results
+
+            except (TTransportException, IOErrorException, RuntimeError) as e:
+                LOGGER.debug(
+                    f"Connection to Nebula Graph is lost. It could be "
+                    f"due to idle for too long, or network issue: {e}."
+                    f"Trying to reconnect...")
+                self.init_connection()
+                raise e
 
             except Exception as e:
                 if LOGGER.isEnabledFor(logging.DEBUG):
@@ -1261,7 +1335,8 @@ class NebulaProxy(BaseProxy):
         index_n = self._get_result_column_index(record, 'n')
         if record.get('data', None):
             # There should be one and only one record
-            ts = record['data'][0]['row'][index_n].get("Updatedtimestamp.latest_timestamp", 0)
+            ts = record['data'][0]['row'][index_n].get(
+                "Updatedtimestamp.latest_timestamp", 0)
             if ts is None:
                 return 0
             else:
@@ -1713,7 +1788,7 @@ class NebulaProxy(BaseProxy):
                                 manager_name: Optional[str] = None
                                 ) -> UserEntity:
         """
-        Builds user record from Cypher query result. Other than the one defined in amundsen_common.models.user.User,
+        Builds user record from query result. Other than the one defined in amundsen_common.models.user.User,
         you could add more fields from User node into the User model by specifying keys in config.USER_OTHER_KEYS
         :param record:
         :param manager_name:
@@ -1749,7 +1824,7 @@ class NebulaProxy(BaseProxy):
             resource_type: ResourceType = ResourceType.Table
     ) -> Tuple[str, str]:
         """
-        Returns the relationship clause and the where clause of a cypher query between users and tables
+        Returns the relationship clause and the where clause of a query between users and tables
         The User node is 'usr', the table node is 'tbl', and the relationship is 'rel'
         e.g. (usr:`User`)-[rel:READ]->(tbl:Table), (usr)-[rel:READ]->(tbl)
         """
@@ -2545,7 +2620,7 @@ class NebulaProxy(BaseProxy):
     @timer_with_counter
     def _exec_feature_query(self, *, feature_key: str) -> Dict:
         """
-        Executes cypher query to get feature and related nodes
+        Executes query to get feature and related nodes
         """
 
         feature_query = Template(
@@ -2682,7 +2757,7 @@ class NebulaProxy(BaseProxy):
     def get_resource_generation_code(
             self, *, uri: str, resource_type: ResourceType) -> GenerationCode:
         """
-        Executes cypher query to get query nodes associated with resource
+        Executes query to get query nodes associated with resource
         """
 
         query = Template(
