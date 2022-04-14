@@ -37,6 +37,10 @@ NEBULA_VERTEX_MANDATORY_FIELDS = {
             "type": str,
             "Default": ""
         },
+        "display_name": {
+            "type": str,
+            "Default": ""
+        }
     },
     TypeMetadata.NODE_LABEL: {
         "sort_order": {

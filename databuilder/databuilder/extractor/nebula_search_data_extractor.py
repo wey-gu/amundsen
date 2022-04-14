@@ -38,7 +38,7 @@ class NebulaSearchDataExtractor(Extractor):
         COLLECT(DISTINCT id(`tags`)) AS `tags`
         OPTIONAL MATCH (table)-[:HAS_BADGE]->(badges:Badge)
         WITH db, cluster, schema, schema_description, table, table_description, programmatic_descriptions, `tags`,
-        COLLECT(DISTINCT `badges`) AS badges
+        COLLECT(DISTINCT id(`badges`)) AS badges
         OPTIONAL MATCH (table)-[read:READ_BY]->(`user`:`User`)
         WITH db, cluster, schema, schema_description, table, table_description, programmatic_descriptions, `tags`, badges,
         SUM(read.read_count) AS total_usage,
@@ -52,7 +52,7 @@ class NebulaSearchDataExtractor(Extractor):
         RETURN db.Database.name as database, cluster.Cluster.name AS cluster, schema.Schema.name AS schema,
         schema_description.Description.description AS schema_description,
         table.Table.name AS name, id(table) AS key, table_description.Description.description AS description,
-        time_stamp.`Timestamp`.last_updated_timestamp AS last_updated_timestamp,
+        time_stamp.`Timestamp`.`timestamp` AS last_updated_timestamp,
         column_names,
         column_descriptions,
         total_usage,
@@ -102,7 +102,7 @@ class NebulaSearchDataExtractor(Extractor):
          COLLECT(DISTINCT id(`tags`)) AS `tags`
          OPTIONAL MATCH (dashboard)-[:HAS_BADGE]->(badges:Badge)
          WITH  dashboard, dbg, db_descr, dbg_descr, cluster, last_exec, query_names, chart_names, total_usage, `tags`,
-         COLLECT(DISTINCT `badges`) AS badges
+         COLLECT(DISTINCT id(`badges`)) AS badges
          RETURN dbg.Dashboardgroup.name AS group_name, dashboard.Dashboard.name AS name, cluster.Cluster.name AS cluster,
          COALESCE(db_descr.Description.description, '') AS description,
          COALESCE(dbg.Dashboardgroup.description, '') AS group_description, dbg.Dashboardgroup.dashboard_group_url AS group_url,
@@ -131,9 +131,9 @@ class NebulaSearchDataExtractor(Extractor):
          feature.Feature.entity AS entity,
          description.Description.description AS description,
          db.Database.name AS availability,
-         COLLECT(DISTINCT id(badge)) AS badges,
+         COLLECT(DISTINCT id(`badge`)) AS badges,
          COLLECT(DISTINCT id(`tag`)) AS `tags`,
-         toInteger(feature.Feature.last_updated_timestamp) AS last_updated_timestamp
+         toInteger(feature.Feature.`timestamp`) AS last_updated_timestamp
          ORDER BY feature_group, feature_name, version
         """)
 
