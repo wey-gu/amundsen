@@ -8,7 +8,7 @@ import re
 import textwrap
 import time
 
-from threading import Lock
+from threading import Lock, Timer
 
 from contextlib import contextmanager
 from random import randint
@@ -40,11 +40,10 @@ from beaker.cache import CacheManager
 from beaker.util import parse_cache_config_options
 from flask import current_app, has_app_context
 from jinja2 import Template
-from nebula3.common.ttypes import Value as NebulaValue
 from nebula3.Config import Config as NebulaConfig
 from nebula3.gclient.net import ConnectionPool, Session
 from nebula3.fbthrift.transport.TTransport import TTransportException
-from nebula3.Exception import IOErrorException
+from nebula3.Exception import IOErrorException, NotValidConnectionException
 from metadata_service import config
 from metadata_service.entity.dashboard_detail import \
     DashboardDetail as DashboardDetailEntity
@@ -119,11 +118,12 @@ class NebulaProxy(BaseProxy):
 
     def init_connection(self) -> None:
         hosts = self.host.split(",")
-        with self.get_conn_init_lock(timeout_sec=3):
-            if self._queue:
-                for s in self._queue.queue:
-                    s.release()
-            self._queue = queue.Queue()
+        with self.get_conn_init_lock(timeout_sec=3, delay_sec=10) as lock:
+            if not lock:
+                LOGGER.debug(
+                    "Failed to acquire lock to init connection, skip init")
+                return
+            _queue = queue.Queue()
             if self._connection_pool is not None:
                 LOGGER.info("Connection pool already exists, closing it.")
                 self._connection_pool.close()
@@ -142,25 +142,41 @@ class NebulaProxy(BaseProxy):
                         f", hosts: { hosts }, please ensure the Nebula Graph was"
                         f"bootstraped with Dataloader. Result: { _ }")
                     raise NebulaQueryExecutionError(
-                        f"Failed to switch graph space {self.space}")
-                self._queue.put(session)
+                        r_code, f"Failed to switch graph space {self.space}")
+                _queue.put(session)
+
+            if self._queue:
+                old_queue = self._queue
+                self._queue = _queue
+                for s in old_queue.queue:
+                    s.release()
+            else:
+                self._queue = _queue
 
     @contextmanager
-    def get_conn_init_lock(self, timeout_sec):
+    def get_conn_init_lock(self,
+                           timeout_sec: int,
+                           delay_sec: int = 10) -> bool:
+        """
+        Acquire the lock to init the connection pool.
+        :param timeout_sec: timeout in seconds
+        :param delay_sec: delay in seconds, this was used to avoid race condition
+        """
         lock = False
         try:
             lock = _NEBULA_CONNECTION_INIT_LOCK.acquire(timeout=timeout_sec)
             yield lock
-            if lock:
-                _NEBULA_CONNECTION_INIT_LOCK.release
+
         except Exception as e:
             LOGGER.exception(
                 f"Something went wrong during the connection init: {e}")
         finally:
             if lock and _NEBULA_CONNECTION_INIT_LOCK.locked():
-                LOGGER.debug("Finally force releasing lock.")
+                LOGGER.debug(f"Will release lock in {delay_sec} seconds.")
                 try:
-                    _NEBULA_CONNECTION_INIT_LOCK.release()
+                    delay_timer = Timer(delay_sec,
+                                        _NEBULA_CONNECTION_INIT_LOCK.release)
+                    delay_timer.start()
                 except RuntimeError:
                     pass
                 except Exception as e:
@@ -169,23 +185,30 @@ class NebulaProxy(BaseProxy):
     @contextmanager
     def get_session(self) -> Session:
         try:
+            if self._queue is None:
+                LOGGER.debug("Connection pool is not initialized, init it.")
+                self.init_connection()
             session = self._queue.get(timeout=1)
+            queue_id = id(self._queue)
         except queue.Empty:
             if self._queue.qsize() < self.config.max_connection_pool_size:
                 try:
-                    session = self._connection_pool.get_session()
+                    session = self._connection_pool.get_session(
+                        self.user, self.password)
                     session.execute_json(f"USE { self.space }")
                 except Exception as e:
                     LOGGER.debug(f"Failed to get session: {e}")
                     raise NebulaQueryExecutionError(
-                        f"Failed to get session: {e}")
+                        "", f"Failed to get session: {e}")
             else:
                 raise NebulaQueryExecutionError(
-                    f"maximum connection pool size reached")
+                    "", f"maximum connection pool size reached")
+
         try:
             yield session
 
-        except (TTransportException, IOErrorException, RuntimeError) as e:
+        except (TTransportException, IOErrorException, RuntimeError,
+                NotValidConnectionException) as e:
             # idle session will be released from server side
             # see: https://docs.nebula-graph.io/3.0.2/5.configurations-and-logs/1.configurations/3.graph-config/
             # client_idle_timeout_secs and session_idle_timeout_secs to be configured in graphd.conf
@@ -198,7 +221,12 @@ class NebulaProxy(BaseProxy):
         finally:
             try:
                 if session:
-                    self._queue.put(session)
+                    # if self._queue was muted, then we won't put it back to queue
+                    if id(self._queue) == queue_id:
+                        self._queue.put(session)
+                    else:
+                        session.release()
+                        del session
             except NameError:
                 LOGGER.info(
                     "session was deleted, will not be put back to queue")
@@ -575,7 +603,7 @@ class NebulaProxy(BaseProxy):
         OPTIONAL MATCH (app_consumer:Application)-[:CONSUMES]->(tbl)
         OPTIONAL MATCH (tbl)-[:LAST_UPDATED_AT]->(t:`Timestamp`)
         OPTIONAL MATCH (owner:`User`)<-[:OWNER]-(tbl)
-        OPTIONAL MATCH (tbl)-[:TAGGED_BY]->(`tag`:`Tag`{tag_type: $tag_normal_type})
+        OPTIONAL MATCH (tbl)-[:TAGGED_BY]->(`tag`:`Tag`{tag_type: "default"})
         OPTIONAL MATCH (tbl)-[:HAS_BADGE]->(badge:Badge)
         OPTIONAL MATCH (tbl)-[:SOURCE]->(src:Source)
         OPTIONAL MATCH (tbl)-[:DESCRIPTION]->(prog_descriptions:Programmatic_Description)
@@ -593,8 +621,10 @@ class NebulaProxy(BaseProxy):
         """))
 
         table_records = self._execute_query(
-            query=table_level_query.render(vid=table_uri),
-            param_dict={"tag_normal_type": NebulaValue(sVal="default")})[0]
+            query=table_level_query.render(vid=table_uri), param_dict={})[0]
+        # hardcoded as default for now
+        # from nebula3.common.ttypes import Value as NebulaValue
+        # param_dict={"tag_normal_type": NebulaValue(sVal="default")})[0]
 
         (wmk_results, table_writer, table_apps, timestamp_value, owner_record,
          tags, src, badges, prog_descriptions,
@@ -859,7 +889,8 @@ class NebulaProxy(BaseProxy):
                         r_code, results[0].get('errors', ''))
                 return results
 
-            except (TTransportException, IOErrorException, RuntimeError) as e:
+            except (TTransportException, IOErrorException, RuntimeError,
+                    NotValidConnectionException) as e:
                 LOGGER.debug(
                     f"Connection to Nebula Graph is lost. It could be "
                     f"due to idle for too long, or network issue: {e}."
@@ -2148,7 +2179,7 @@ class NebulaProxy(BaseProxy):
         OPTIONAL MATCH (d:Dashboard)-[:LAST_UPDATED_AT]->(t:`Timestamp`)
         OPTIONAL MATCH (d:Dashboard)-[:OWNER]->(owner:`User`)
         WITH c, dg, d, description, last_exec, last_success_exec, t, collect(owner) AS owners
-        OPTIONAL MATCH (d:Dashboard)-[:TAGGED_BY]->(`tag`:`Tag`{tag_type: $tag_normal_type})
+        OPTIONAL MATCH (d:Dashboard)-[:TAGGED_BY]->(`tag`:`Tag`{tag_type: "default"})
         OPTIONAL MATCH (d:Dashboard)-[:HAS_BADGE]->(badge:Badge)
         WITH c, dg, d, description, last_exec, last_success_exec, t, owners, collect(`tag`) AS `tags`,
         collect(badge) AS badges
@@ -2192,8 +2223,9 @@ class NebulaProxy(BaseProxy):
         """))
 
         dashboard_record = self._execute_query(
-            query=get_dashboard_detail_query.render(id=id),
-            param_dict={"tag_normal_type": NebulaValue(sVal="default")})[0]
+            query=get_dashboard_detail_query.render(id=id), param_dict={})[0]
+        # Hardcode as default for now.
+        # param_dict={"tag_normal_type": NebulaValue(sVal="default")})[0]
 
         data_records = dashboard_record.get('data', [])
 
