@@ -65,6 +65,8 @@ CREATED_EPOCH_MS = 'publisher_created_epoch_ms'
 LAST_UPDATED_EPOCH_MS = 'publisher_last_updated_epoch_ms'
 PUBLISHED_PROPERTY_NAME = 'published_tag'
 
+CONN_INIT_LOCK_TIMEOUT = 10
+
 LOGGER = logging.getLogger(__name__)
 
 _NEBULA_CONNECTION_INIT_LOCK = Lock()
@@ -103,7 +105,10 @@ class NebulaProxy(BaseProxy):
         than surrounding network environment's timeout.
         ToDo: TLS support.
         """
-        LOGGER.info('Nebula endpoint: {}'.format(str(host)))
+        LOGGER.info(
+            f"Nebula Proxy init with hosts: {host}, port: {port}"
+            f", num_conns: {num_conns}, query_timeout_sec: {query_timeout_sec}"
+        )
         self.host = host
         self.port = port
         self.user = user
@@ -118,32 +123,56 @@ class NebulaProxy(BaseProxy):
 
     def init_connection(self) -> None:
         hosts = self.host.split(",")
-        with self.get_conn_init_lock(timeout_sec=3, delay_sec=10) as lock:
+        with self.get_conn_init_lock(timeout_sec=3,
+                                     delay_sec=CONN_INIT_LOCK_TIMEOUT) as lock:
             if not lock:
-                LOGGER.debug(
-                    "Failed to acquire lock to init connection, skip init")
+                if LOGGER.isEnabledFor(logging.DEBUG):
+                    LOGGER.debug("Failed to acquire lock to init connection,"
+                                 " skipping init...(this should be fine as "
+                                 "another connection init should be ongoing.)")
                 return
             _queue = queue.Queue()
             if self._connection_pool is not None:
-                LOGGER.info("Connection pool already exists, closing it.")
+                LOGGER.info(
+                    "Connection pool already exists, this is a reconnection attempt, "
+                    "closing the old pool first.")
                 self._connection_pool.close()
             self._connection_pool = ConnectionPool()
             self._connection_pool.init([(h, self.port) for h in hosts],
                                        self.config)
 
+            r_error = []
             for c in range(self.config.max_connection_pool_size):
                 session = self._connection_pool.get_session(
                     self.user, self.password)
                 result = session.execute_json(f"USE { self.space }")
-                _, r_code = self._decode_json_result(result)
+                r_, r_code = self._decode_json_result(result)
                 if r_code != 0:
-                    LOGGER.exception(
-                        f"Failed to Failed to switch to Space: { self.space }"
-                        f", hosts: { hosts }, please ensure the Nebula Graph was"
-                        f"bootstraped with Dataloader. Result: { _ }")
-                    raise NebulaQueryExecutionError(
-                        r_code, f"Failed to switch graph space {self.space}")
-                _queue.put(session)
+                    r_error.append(r_)
+                    if LOGGER.isEnabledFor(logging.DEBUG):
+                        LOGGER.exception(
+                            f"Switching Space: { self.space } failed "
+                            f"with code: { r_code }, hosts: { hosts }, "
+                            f"please ensure the Nebula Graph was"
+                            f"bootstraped with Dataloader. Result: { r_ }")
+                else:
+                    _queue.put(session)
+            if 0 < _queue.qsize() < self.config.max_connection_pool_size:
+                if LOGGER.isEnabledFor(logging.DEBUG):
+                    LOGGER.debug(
+                        f"Failure occurred during to init connection pool, only { _queue.qsize() } connections"
+                        f"are available, expected { self.config.max_connection_pool_size } connections."
+                    )
+            if _queue.qsize() == 0:
+                if LOGGER.isEnabledFor(logging.DEBUG):
+                    LOGGER.debug(
+                        f"Failed to init connection pool, no connection got, "
+                        f"hosts: { hosts }, please ensure the Nebula Graph cluster"
+                        f"is ready. Results: { r_error }")
+                raise NebulaQueryExecutionError(
+                    "", f"Failed to init connection pool, no connection got"
+                    f"hosts: { hosts }, please ensure the Nebula Graph cluster"
+                    f"is ready. First failure result: { r_error[:1] }")
 
             if self._queue:
                 old_queue = self._queue
@@ -168,11 +197,13 @@ class NebulaProxy(BaseProxy):
             yield lock
 
         except Exception as e:
-            LOGGER.exception(
-                f"Something went wrong during the connection init: {e}")
+            if LOGGER.isEnabledFor(logging.DEBUG):
+                LOGGER.exception(
+                    f"Something went wrong during the connection init: { e }")
         finally:
             if lock and _NEBULA_CONNECTION_INIT_LOCK.locked():
-                LOGGER.debug(f"Will release lock in {delay_sec} seconds.")
+                LOGGER.info(f"Will release lock in { delay_sec } seconds"
+                            f" to avoid race condtion.")
                 try:
                     delay_timer = Timer(delay_sec,
                                         _NEBULA_CONNECTION_INIT_LOCK.release)
@@ -180,26 +211,32 @@ class NebulaProxy(BaseProxy):
                 except RuntimeError:
                     pass
                 except Exception as e:
-                    LOGGER.exception(f"Force release lock failed: {e},")
+                    if LOGGER.isEnabledFor(logging.DEBUG):
+                        LOGGER.exception(f"Force release lock failed: { e },")
 
     @contextmanager
     def get_session(self) -> Session:
         try:
             if self._queue is None:
-                LOGGER.debug("Connection pool is not initialized, init it.")
+                if LOGGER.isEnabledFor(logging.DEBUG):
+                    LOGGER.debug(
+                        "Connection pool was not initialized, init it.")
                 self.init_connection()
             session = self._queue.get(timeout=1)
             queue_id = id(self._queue)
         except queue.Empty:
-            if self._queue.qsize() < self.config.max_connection_pool_size:
+            queue_size = self._queue.qsize()
+            if queue_size < self.config.max_connection_pool_size:
                 try:
                     session = self._connection_pool.get_session(
                         self.user, self.password)
                     session.execute_json(f"USE { self.space }")
                 except Exception as e:
-                    LOGGER.debug(f"Failed to get session: {e}")
+                    if LOGGER.isEnabledFor(logging.DEBUG):
+                        LOGGER.debug(f"Failed to get a new session: { e }"
+                                     f"when queue size is { queue_size }")
                     raise NebulaQueryExecutionError(
-                        "", f"Failed to get session: {e}")
+                        "", f"Failed to get session: { e }")
             else:
                 raise NebulaQueryExecutionError(
                     "", f"maximum connection pool size reached")
@@ -212,26 +249,42 @@ class NebulaProxy(BaseProxy):
             # idle session will be released from server side
             # see: https://docs.nebula-graph.io/3.0.2/5.configurations-and-logs/1.configurations/3.graph-config/
             # client_idle_timeout_secs and session_idle_timeout_secs to be configured in graphd.conf
-            LOGGER.debug(f"Connection to Nebula Graph is lost. It could be "
-                         f"due to idle for too long, or network issue: {e}."
-                         f"Trying to reconnect...")
+            LOGGER.exception(
+                f"Connection to Nebula Graph is lost. It could be "
+                f"due to idle for too long or network issue: { e }. "
+                f"Trying to reconnect...")
             self.init_connection()
             raise e
 
         finally:
             try:
                 if session:
-                    # if self._queue was muted, then we won't put it back to queue
                     if id(self._queue) == queue_id:
+                        if not session.ping():
+                            if LOGGER.isEnabledFor(logging.DEBUG):
+                                LOGGER.debug(
+                                    f"Session { session } is not valid anymore, "
+                                    f"will release it.")
+                            session.release()
+                            del session
                         self._queue.put(session)
                     else:
+                        # self._queue was muted, we won't put it back to queue
+                        if LOGGER.isEnabledFor(logging.DEBUG):
+                            LOGGER.debug(
+                                f"Queue { self._queue } was muted, will not put "
+                                f"back session: { session }, "
+                                f"queue size: { self._queue.qsize() }")
                         session.release()
                         del session
             except NameError:
-                LOGGER.info(
-                    "session was deleted, will not be put back to queue")
+                if LOGGER.isEnabledFor(logging.DEBUG):
+                    LOGGER.debug(
+                        "session was deleted, will not be put back to queue")
             except Exception as e:
-                LOGGER.exception(f"Failed to put session back to queue: {e}")
+                if LOGGER.isEnabledFor(logging.DEBUG):
+                    LOGGER.exception(
+                        f"Failed to put session back to queue: { e }")
 
     def health(self) -> health_check.HealthCheck:
         """
@@ -891,10 +944,11 @@ class NebulaProxy(BaseProxy):
 
             except (TTransportException, IOErrorException, RuntimeError,
                     NotValidConnectionException) as e:
-                LOGGER.debug(
-                    f"Connection to Nebula Graph is lost. It could be "
-                    f"due to idle for too long, or network issue: {e}."
-                    f"Trying to reconnect...")
+                if LOGGER.isEnabledFor(logging.DEBUG):
+                    LOGGER.debug(
+                        f"Connection to Nebula Graph is lost. It could be "
+                        f"due to idle for too long, or network issue: { e }."
+                        f"Trying to reconnect...")
                 self.init_connection()
                 raise e
 
